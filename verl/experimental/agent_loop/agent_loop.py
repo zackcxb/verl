@@ -101,10 +101,12 @@ def _get_rollout_and_model_config(config: DictConfig) -> tuple[DictConfig, DictC
     else:
         return config.rollout, config.model
 
-#TODO: this base class includes only gateway-related functionalities but named LLMServerManager
-#      is this the correct abstraction? Shall we change it to a mixin?
-class LLMServerManager:
-    """Own rollout serving handles and optional gateway-backed session runtime."""
+class AsyncLLMServerManager:
+    """
+    A class to manage multiple OpenAI compatible LLM servers. This class provides
+    - Load balance: least in-flight requests load balancing via global coordination
+    - Sticky session: send multi-turn chat completions to same server for automatic prefix caching
+    """
 
     def __init__(
         self,
@@ -118,6 +120,13 @@ class LLMServerManager:
         gateway_actor_kwargs: dict[str, Any] | None = None,
         gateway_actor_options: dict[str, Any] | None = None,
     ):
+        """Initialize the AsyncLLMServerManager.
+
+        Args:
+            config (DictConfig): whole config for main entrypoint.
+            servers (list[tuple[str, ray.actor.ActorHandle]]): (address, handle) pairs for each LLM server.
+            load_balancer_handle (ray.actor.ActorHandle): shared global load balancer actor.
+        """
         self.config = config
         self._load_balancer = load_balancer_handle
         self._server_id_to_handle: dict[str, ray.actor.ActorHandle] = dict(servers or [])
@@ -147,8 +156,7 @@ class LLMServerManager:
         gateway_actor_cls = gateway_actor_cls or GatewayActor
         gateway_actor_kwargs = dict(gateway_actor_kwargs or {})
         gateway_actor_options = gateway_actor_options or {}
-        if "backend" not in gateway_actor_kwargs:
-            gateway_actor_kwargs["backend"] = self.build_gateway_backend()
+        gateway_actor_kwargs.setdefault("backend", self)
         self.gateway_backend = gateway_actor_kwargs["backend"]
 
         self.owned_gateway_actors = [
@@ -157,9 +165,6 @@ class LLMServerManager:
         ]
         ray.get([gateway.start.remote() for gateway in self.owned_gateway_actors])
         self.gateway_manager = GatewayManager(self.owned_gateway_actors)
-
-    def build_gateway_backend(self):
-        raise RuntimeError("gateway backend must be provided unless the serving manager implements build_gateway_backend")
 
     def _require_session_runtime(self):
         if self.gateway_manager is None:
@@ -193,47 +198,9 @@ class LLMServerManager:
         self.owned_gateway_actors = []
         self.gateway_manager = None
 
-
-class AsyncLLMServerManager(LLMServerManager):
-    """
-    A class to manage multiple OpenAI compatible LLM servers. This class provides
-    - Load balance: least in-flight requests load balancing via global coordination
-    - Sticky session: send multi-turn chat completions to same server for automatic prefix caching
-    """
-
-    def __init__(
-        self,
-        config: DictConfig,
-        servers: list[tuple[str, ray.actor.ActorHandle]],
-        load_balancer_handle: ray.actor.ActorHandle,
-        *,
-        gateway_manager=None,
-        gateway_count: int = 0,
-        gateway_actor_cls=None,
-        gateway_actor_kwargs: dict[str, Any] | None = None,
-        gateway_actor_options: dict[str, Any] | None = None,
-    ):
-        """Initialize the AsyncLLMServerManager.
-
-        Args:
-            config (DictConfig): whole config for main entrypoint.
-            servers (list[tuple[str, ray.actor.ActorHandle]]): (address, handle) pairs for each LLM server.
-            load_balancer_handle (ray.actor.ActorHandle): shared global load balancer actor.
-        """
-        super().__init__(
-            config=config,
-            servers=servers,
-            load_balancer_handle=load_balancer_handle,
-            gateway_manager=gateway_manager,
-            gateway_count=gateway_count,
-            gateway_actor_cls=gateway_actor_cls,
-            gateway_actor_kwargs=gateway_actor_kwargs,
-            gateway_actor_options=gateway_actor_options,
-        )
-
     async def _acquire_server(self, request_id: str) -> tuple[str, ray.actor.ActorHandle]:
         if self._load_balancer is None:
-            raise RuntimeError("LLMServerManager has no configured load balancer")
+            raise RuntimeError("AsyncLLMServerManager has no configured load balancer")
         server_id = await self._load_balancer.acquire_server.remote(request_id=request_id)
         handle = self._server_id_to_handle.get(server_id)
         if handle is None:
@@ -244,13 +211,6 @@ class AsyncLLMServerManager(LLMServerManager):
         # Fire-and-forget: release is just a counter decrement, no need to await.
         # Awaiting here risks blocking the finally clause if the LB actor is unresponsive.
         self._load_balancer.release_server.remote(server_id=server_id)
-
-    def build_gateway_backend(self):
-        return _GatewayServingBackend(
-            config=self.config,
-            servers=list(self._server_id_to_handle.items()),
-            load_balancer_handle=self._load_balancer,
-        )
 
     @rollout_trace_op
     async def generate(
@@ -284,39 +244,6 @@ class AsyncLLMServerManager(LLMServerManager):
             return output
         finally:
             self._release_server(server_id)
-
-# TODO: check if this wrapper is necessary at all.
-class _GatewayServingBackend:
-    """Gateway-facing serving adapter owned and constructed by AsyncLLMServerManager."""
-
-    def __init__(
-        self,
-        config: DictConfig,
-        servers: list[tuple[str, ray.actor.ActorHandle]],
-        load_balancer_handle: ray.actor.ActorHandle,
-    ):
-        self._server_manager = AsyncLLMServerManager(
-            config=config,
-            servers=servers,
-            load_balancer_handle=load_balancer_handle,
-        )
-
-    async def generate(
-        self,
-        request_id,
-        *,
-        prompt_ids: list[int],
-        sampling_params: dict[str, Any],
-        image_data: Optional[list[Any]] = None,
-        video_data: Optional[list[Any]] = None,
-    ) -> TokenOutput:
-        return await self._server_manager.generate(
-            request_id=request_id,
-            prompt_ids=prompt_ids,
-            sampling_params=sampling_params,
-            image_data=image_data,
-            video_data=video_data,
-        )
 
 
 class AgentLoopMetrics(BaseModel):
