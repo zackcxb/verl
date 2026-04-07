@@ -21,12 +21,6 @@ def _resolve_trajectory_value(value: Any, index: int, count: int) -> Any:
     return value
 
 
-def _coerce_reward_score(value: Any) -> float:
-    if isinstance(value, np.generic):
-        value = value.item()
-    return float(value)
-
-
 def normalize_trajectory_rewards(
     trajectories: Sequence[Trajectory],
     reward_info: Mapping[str, Any] | None = None,
@@ -41,11 +35,7 @@ def normalize_trajectory_rewards(
             for key, value in reward_info.items():
                 merged_reward_info[key] = _resolve_trajectory_value(value, index=index, count=count)
 
-        reward_score = trajectory.reward_score
-        if reward_key in merged_reward_info and merged_reward_info[reward_key] is not None:
-            reward_score = _coerce_reward_score(merged_reward_info[reward_key])
-
-        normalized.append(replace(trajectory, reward_info=merged_reward_info, reward_score=reward_score))
+        normalized.append(replace(trajectory, reward_info=merged_reward_info, reward_score=trajectory.reward_score))
 
     return normalized
 

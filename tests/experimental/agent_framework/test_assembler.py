@@ -16,6 +16,7 @@ def test_trajectory_assembler_matches_training_batch_contract():
             response_mask=[1, 1, 0],
             response_logprobs=[-0.1, -0.2, 0.0],
             reward_info={"score": 0.5, "label": "alpha"},
+            reward_score=0.5,
             num_turns=2,
             routed_experts=torch.tensor(
                 [
@@ -37,6 +38,7 @@ def test_trajectory_assembler_matches_training_batch_contract():
             response_mask=[1, 1],
             response_logprobs=[-0.3, -0.4],
             reward_info={"score": 1.5, "label": "beta"},
+            reward_score=1.5,
             num_turns=3,
             routed_experts=torch.tensor(
                 [

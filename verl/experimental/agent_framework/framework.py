@@ -1,6 +1,14 @@
 from abc import ABC, abstractmethod
+from collections.abc import Awaitable, Callable, Sequence
+from typing import TYPE_CHECKING
 
 from verl.protocol import DataProto
+
+if TYPE_CHECKING:
+    from .types import Trajectory
+
+
+TrajectoryRewardCompute = Callable[..., Sequence["Trajectory"] | Awaitable[Sequence["Trajectory"]]]
 
 
 class AgentFramework(ABC):

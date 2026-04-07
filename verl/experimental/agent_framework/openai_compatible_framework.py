@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import inspect
 from uuid import uuid4
 
 from verl.protocol import DataProto
 
 from .assembler import TrajectoryAssembler
-from .framework import AgentFramework
+from .framework import AgentFramework, TrajectoryRewardCompute
 
 # TODO: shall we put this in the framework module?
 class OpenAICompatibleAgentFramework(AgentFramework):
@@ -14,6 +15,7 @@ class OpenAICompatibleAgentFramework(AgentFramework):
         session_runtime, # TODO: confusing variable name, unify this with the LLMServer class in agent_loop.py
         agent_runner,
         *,
+        reward_compute: TrajectoryRewardCompute,
         assembler: TrajectoryAssembler | None = None,
         pad_token_id: int = 0,
         reward_key: str = "reward",
@@ -22,13 +24,13 @@ class OpenAICompatibleAgentFramework(AgentFramework):
     ):
         self.session_runtime = session_runtime
         self.agent_runner = agent_runner
+        self.reward_compute = reward_compute
         self.assembler = assembler or TrajectoryAssembler(pad_token_id=pad_token_id, reward_key=reward_key)
         self.completion_timeout = completion_timeout
         self.wait_for_completion_after_agent_run = wait_for_completion_after_agent_run
 
     async def generate_sequences(self, prompts: DataProto) -> DataProto:
         raw_prompts = prompts.non_tensor_batch.get("raw_prompt")
-        # TODO: shall we allow token ids as input?
         if raw_prompts is None:
             raise ValueError("OpenAICompatibleAgentFramework requires non_tensor_batch['raw_prompt']")
 
@@ -44,7 +46,20 @@ class OpenAICompatibleAgentFramework(AgentFramework):
                 )
                 if self.wait_for_completion_after_agent_run:
                     await self.session_runtime.wait_for_completion(session_id, timeout=self.completion_timeout)
-                trajectories.extend(await self.session_runtime.finalize_session(session_id))
+                finalized_trajectories = await self.session_runtime.finalize_session(session_id)
+                session_reward_info = dict(finalized_trajectories[0].reward_info) if finalized_trajectories else None
+                computed_trajectories = self.reward_compute(
+                    trajectories=finalized_trajectories,
+                    prompts=prompts,
+                    sample_index=sample_index,
+                    session_reward_info=session_reward_info,
+                )
+                if inspect.isawaitable(computed_trajectories):
+                    computed_trajectories = await computed_trajectories
+                computed_trajectories = list(computed_trajectories)
+                if any(trajectory.reward_score is None for trajectory in computed_trajectories):
+                    raise ValueError("reward_compute must set reward_score for every trajectory")
+                trajectories.extend(computed_trajectories)
             except Exception:
                 await self.session_runtime.abort_session(session_id)
                 raise

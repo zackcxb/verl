@@ -21,7 +21,7 @@ def test_agent_framework_is_thin_generate_sequences_only():
     assert asyncio.run(framework.generate_sequences(prompts)) is prompts
 
 
-def test_normalize_trajectory_rewards_broadcasts_session_reward_info():
+def test_normalize_trajectory_rewards_merges_session_reward_info_without_inventing_reward_scores():
     trajectories = [
         Trajectory(
             uid="sample-0",
@@ -47,8 +47,9 @@ def test_normalize_trajectory_rewards_broadcasts_session_reward_info():
         reward_key="score",
     )
 
-    assert [traj.reward_score for traj in normalized] == [1.25, 1.25]
+    assert [traj.reward_score for traj in normalized] == [None, None]
     assert all(traj.reward_info["format_ok"] is True for traj in normalized)
+    assert [traj.reward_info["score"] for traj in normalized] == [1.25, 1.25]
     assert [traj.reward_info["label"] for traj in normalized] == ["A", "A"]
 
 

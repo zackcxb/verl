@@ -5,6 +5,7 @@ import ray
 from dataclasses import replace
 
 from tests.experimental.agent_gateway.support import FakeTokenizer, QueuedBackend
+from verl.experimental.agent_framework.types import SessionHandle, Trajectory
 from verl.protocol import DataProto
 
 
@@ -31,6 +32,26 @@ class _RecordingSessionRuntime:
     async def wait_for_completion(self, session_id: str, timeout: float | None = None) -> None:
         self.waited_sessions.append(session_id)
         await self.delegate.wait_for_completion(session_id, timeout=timeout)
+
+
+class _StaticSessionRuntime:
+    def __init__(self, trajectories, reward_info):
+        self.trajectories = trajectories
+        self.reward_info = reward_info
+        self.finalized_sessions = []
+
+    async def create_session(self, session_id: str, **kwargs):
+        return SessionHandle(session_id=session_id, base_url="http://unused/session/v1")
+
+    async def finalize_session(self, session_id: str):
+        self.finalized_sessions.append(session_id)
+        return [replace(trajectory, reward_info=dict(self.reward_info)) for trajectory in self.trajectories]
+
+    async def abort_session(self, session_id: str) -> None:
+        return None
+
+    async def wait_for_completion(self, session_id: str, timeout: float | None = None) -> None:
+        return None
 
 
 @pytest.fixture
@@ -147,3 +168,112 @@ async def test_openai_compatible_framework_requires_explicit_reward_compute(ray_
             reward_key="score",
         )
     await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_framework_rejects_reward_compute_without_scores():
+    from verl.experimental.agent_framework.openai_compatible_framework import OpenAICompatibleAgentFramework
+
+    session_runtime = _StaticSessionRuntime(
+        trajectories=[
+            Trajectory(
+                uid="sample-0",
+                session_id="session-0",
+                trajectory_id=0,
+                prompt_ids=[11, 12],
+                response_ids=[21],
+                response_mask=[1],
+            )
+        ],
+        reward_info={"score": 1.0, "label": "shared"},
+    )
+
+    async def mock_agent(*, raw_prompt, session, sample_index):
+        return None
+
+    async def reward_compute(*, trajectories, prompts, sample_index, session_reward_info):
+        return trajectories
+
+    framework = OpenAICompatibleAgentFramework(
+        session_runtime=session_runtime,
+        agent_runner=mock_agent,
+        reward_compute=reward_compute,
+        reward_key="score",
+    )
+
+    prompts = DataProto(
+        non_tensor_batch={
+            "raw_prompt": np.array(
+                [
+                    [{"role": "user", "content": "Return label C"}],
+                ],
+                dtype=object,
+            ),
+        }
+    )
+
+    with pytest.raises(ValueError, match="reward_score"):
+        await framework.generate_sequences(prompts)
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_framework_reward_compute_can_assign_shared_reward_to_multiple_trajectories():
+    from verl.experimental.agent_framework.openai_compatible_framework import OpenAICompatibleAgentFramework
+
+    session_runtime = _StaticSessionRuntime(
+        trajectories=[
+            Trajectory(
+                uid="sample-0",
+                session_id="session-0",
+                trajectory_id=0,
+                prompt_ids=[11, 12],
+                response_ids=[21],
+                response_mask=[1],
+            ),
+            Trajectory(
+                uid="sample-0",
+                session_id="session-0",
+                trajectory_id=1,
+                prompt_ids=[11, 12, 13],
+                response_ids=[31, 32],
+                response_mask=[1, 1],
+            ),
+        ],
+        reward_info={"score": 1.25, "label": "shared"},
+    )
+
+    async def mock_agent(*, raw_prompt, session, sample_index):
+        return None
+
+    async def reward_compute(*, trajectories, prompts, sample_index, session_reward_info):
+        return [
+            replace(
+                trajectory,
+                reward_info=dict(session_reward_info or {}),
+                reward_score=float((session_reward_info or {})["score"]),
+            )
+            for trajectory in trajectories
+        ]
+
+    framework = OpenAICompatibleAgentFramework(
+        session_runtime=session_runtime,
+        agent_runner=mock_agent,
+        reward_compute=reward_compute,
+        reward_key="score",
+    )
+
+    prompts = DataProto(
+        non_tensor_batch={
+            "raw_prompt": np.array(
+                [
+                    [{"role": "user", "content": "Return label D"}],
+                ],
+                dtype=object,
+            ),
+        }
+    )
+
+    output = await framework.generate_sequences(prompts)
+
+    assert tuple(output.batch["rm_scores"].shape) == tuple(output.batch["responses"].shape)
+    assert output.non_tensor_batch["label"].tolist() == ["shared", "shared"]
