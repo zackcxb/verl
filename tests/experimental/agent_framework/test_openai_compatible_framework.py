@@ -2,6 +2,7 @@ import httpx
 import numpy as np
 import pytest
 import ray
+from dataclasses import replace
 
 from tests.experimental.agent_gateway.support import FakeTokenizer, QueuedBackend
 from verl.protocol import DataProto
@@ -42,9 +43,9 @@ def ray_runtime():
 @pytest.mark.asyncio
 async def test_openai_compatible_framework_runs_minimal_remote_style_path(ray_runtime):
     from verl.experimental.agent_framework.openai_compatible_framework import OpenAICompatibleAgentFramework
-    from verl.experimental.agent_loop.agent_loop import LLMServerManager
+    from verl.experimental.agent_loop.agent_loop import AsyncLLMServerManager
 
-    manager = LLMServerManager(
+    manager = AsyncLLMServerManager(
         config=None,
         servers=[],
         load_balancer_handle=None,
@@ -73,9 +74,20 @@ async def test_openai_compatible_framework_runs_minimal_remote_style_path(ray_ru
             )
             assert complete.status_code == 200
 
+    async def reward_compute(*, trajectories, prompts, sample_index, session_reward_info):
+        return [
+            replace(
+                trajectory,
+                reward_info=dict(session_reward_info or {}),
+                reward_score=float((session_reward_info or {})["score"]),
+            )
+            for trajectory in trajectories
+        ]
+
     framework = OpenAICompatibleAgentFramework(
         session_runtime=session_runtime,
         agent_runner=mock_agent,
+        reward_compute=reward_compute,
         reward_key="score",
     )
 
@@ -103,11 +115,11 @@ async def test_openai_compatible_framework_runs_minimal_remote_style_path(ray_ru
 
 
 @pytest.mark.asyncio
-async def test_openai_compatible_framework_does_not_require_complete_signal(ray_runtime):
+async def test_openai_compatible_framework_requires_explicit_reward_compute(ray_runtime):
     from verl.experimental.agent_framework.openai_compatible_framework import OpenAICompatibleAgentFramework
-    from verl.experimental.agent_loop.agent_loop import LLMServerManager
+    from verl.experimental.agent_loop.agent_loop import AsyncLLMServerManager
 
-    manager = LLMServerManager(
+    manager = AsyncLLMServerManager(
         config=None,
         servers=[],
         load_balancer_handle=None,
@@ -128,26 +140,10 @@ async def test_openai_compatible_framework_does_not_require_complete_signal(ray_
             )
             assert response.status_code == 200
 
-    framework = OpenAICompatibleAgentFramework(
-        session_runtime=session_runtime,
-        agent_runner=mock_agent,
-        reward_key="score",
-    )
-
-    prompts = DataProto(
-        non_tensor_batch={
-            "raw_prompt": np.array(
-                [
-                    [{"role": "user", "content": "Return label B"}],
-                ],
-                dtype=object,
-            ),
-        }
-    )
-
-    output = await framework.generate_sequences(prompts)
+    with pytest.raises(TypeError):
+        OpenAICompatibleAgentFramework(
+            session_runtime=session_runtime,
+            agent_runner=mock_agent,
+            reward_key="score",
+        )
     await manager.shutdown()
-
-    assert len(session_runtime.waited_sessions) == 0
-    assert len(session_runtime.finalized_sessions) == 1
-    assert "rm_scores" not in output.batch.keys()
