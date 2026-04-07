@@ -1,22 +1,35 @@
 import asyncio
+import json
+import re
 
 import ray
+import torch
 
 from verl.experimental.agent_framework.types import SessionHandle, Trajectory
 from verl.workers.rollout.replica import TokenOutput
 
 
 class FakeTokenizer:
+    pad_token = "<pad>"
+
     def encode_messages(self, messages, add_generation_prompt=True):
+        return self.apply_chat_template(messages, tokenize=True, add_generation_prompt=add_generation_prompt)
+
+    def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=True, tools=None, return_dict=False, **kwargs):
         parts = []
         for message in messages:
             parts.append(f"{message['role']}:{self._normalize_content(message.get('content', ''))}\n")
         if add_generation_prompt:
             parts.append("assistant:")
         text = "".join(parts)
+        if tokenize:
+            return [ord(char) for char in text]
+        return text
+
+    def encode(self, text, add_special_tokens=False):
         return [ord(char) for char in text]
 
-    def decode(self, token_ids):
+    def decode(self, token_ids, skip_special_tokens=True):
         return "".join(chr(token_id) for token_id in token_ids)
 
     def _normalize_content(self, content):
@@ -27,11 +40,51 @@ class FakeTokenizer:
         return str(content)
 
 
+class FakeDeltaTokenizer(FakeTokenizer):
+    def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=True, tools=None, return_dict=False, **kwargs):
+        parts = ["<bos>"]
+        for message in messages:
+            parts.append(f"[{message['role']}]{self._normalize_content(message.get('content', ''))}")
+        if add_generation_prompt:
+            parts.append(f"<gen:{len(messages)}>")
+        text = "".join(parts)
+        if tokenize:
+            return [ord(char) for char in text]
+        return text
+
+
+class FakeProcessor(FakeDeltaTokenizer):
+    def __call__(
+        self,
+        *,
+        text,
+        images=None,
+        videos=None,
+        video_metadata=None,
+        return_tensors="pt",
+        do_sample_frames=False,
+    ):
+        rendered = text[0]
+        suffix = f"|images={len(images or [])}|videos={len(videos or [])}"
+        input_ids = [ord(char) for char in rendered + suffix]
+        return {"input_ids": torch.tensor([input_ids], dtype=torch.long)}
+
+
 class QueuedBackend:
     def __init__(self, responses):
         self._responses = list(responses)
+        self.calls = []
 
-    async def generate(self, request_id, *, prompt_ids, sampling_params):
+    async def generate(self, request_id, *, prompt_ids, sampling_params, image_data=None, video_data=None):
+        self.calls.append(
+            {
+                "request_id": request_id,
+                "prompt_ids": list(prompt_ids),
+                "sampling_params": dict(sampling_params),
+                "image_data": image_data,
+                "video_data": video_data,
+            }
+        )
         text = self._responses.pop(0)
         token_ids = [ord(char) for char in text]
         return TokenOutput(
@@ -39,6 +92,32 @@ class QueuedBackend:
             log_probs=[-0.1] * len(token_ids),
             stop_reason="completed",
         )
+
+
+class FakeToolParser:
+    _tool_call_regex = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
+
+    async def extract_tool_calls(self, responses_ids, tools=None):
+        text = "".join(chr(token_id) for token_id in responses_ids)
+        matches = self._tool_call_regex.findall(text)
+        if not matches:
+            return text, []
+
+        tool_calls = []
+        for index, payload in enumerate(matches):
+            parsed = json.loads(payload)
+            tool_calls.append(
+                {
+                    "id": f"call-{index}",
+                    "type": "function",
+                    "function": {
+                        "name": parsed["name"],
+                        "arguments": json.dumps(parsed["arguments"]),
+                    },
+                }
+            )
+        content = self._tool_call_regex.sub("", text)
+        return content, tool_calls
 
 
 @ray.remote
@@ -102,7 +181,7 @@ class RejectConcurrentSessionBackend:
         self._active_request_ids: set[str] = set()
         self.call_windows = []
 
-    async def generate(self, request_id, *, prompt_ids, sampling_params):
+    async def generate(self, request_id, *, prompt_ids, sampling_params, image_data=None, video_data=None):
         if request_id in self._active_request_ids:
             raise RuntimeError(f"concurrent request for session {request_id}")
 
@@ -121,6 +200,36 @@ class RejectConcurrentSessionBackend:
             finished_at = asyncio.get_running_loop().time()
             self.call_windows.append((request_id, started_at, finished_at))
             self._active_request_ids.remove(request_id)
+
+
+class AssertingQueuedBackend:
+    def __init__(self, responses, expected_prompt_ids_per_call, expected_image_data_per_call=None, expected_video_data_per_call=None):
+        self._responses = list(responses)
+        self._expected_prompt_ids_per_call = [list(prompt_ids) for prompt_ids in expected_prompt_ids_per_call]
+        self._expected_image_data_per_call = expected_image_data_per_call
+        self._expected_video_data_per_call = expected_video_data_per_call
+        self.calls = 0
+
+    async def generate(self, request_id, *, prompt_ids, sampling_params, image_data=None, video_data=None):
+        expected_prompt_ids = self._expected_prompt_ids_per_call[self.calls]
+        if list(prompt_ids) != expected_prompt_ids:
+            raise AssertionError(f"unexpected prompt_ids on call {self.calls}: {prompt_ids} != {expected_prompt_ids}")
+        if self._expected_image_data_per_call is not None:
+            expected_image_data = self._expected_image_data_per_call[self.calls]
+            if image_data != expected_image_data:
+                raise AssertionError(f"unexpected image_data on call {self.calls}: {image_data} != {expected_image_data}")
+        if self._expected_video_data_per_call is not None:
+            expected_video_data = self._expected_video_data_per_call[self.calls]
+            if video_data != expected_video_data:
+                raise AssertionError(f"unexpected video_data on call {self.calls}: {video_data} != {expected_video_data}")
+        self.calls += 1
+        text = self._responses.pop(0)
+        token_ids = [ord(char) for char in text]
+        return TokenOutput(
+            token_ids=token_ids,
+            log_probs=[-0.1] * len(token_ids),
+            stop_reason="completed",
+        )
 
 
 @ray.remote

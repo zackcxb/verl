@@ -13,6 +13,8 @@ from fastapi.responses import JSONResponse
 
 from verl.experimental.agent_framework.types import SessionHandle, Trajectory
 from verl.experimental.agent_gateway.types import GatewaySessionState, SessionPhase, TrajectoryBuffer
+from verl.utils.chat_template import apply_chat_template
+from verl.utils.tokenizer import normalize_token_ids
 from verl.workers.rollout.utils import run_uvicorn
 
 
@@ -141,8 +143,20 @@ def _copy_trajectory_buffer(buffer: TrajectoryBuffer | None) -> TrajectoryBuffer
 
 
 class _GatewayActor:
-    def __init__(self, tokenizer, backend, host: str = "127.0.0.1"):
+    def __init__(
+        self,
+        tokenizer,
+        backend,
+        host: str = "127.0.0.1",
+        *,
+        processor=None,
+        tool_parser=None,
+        apply_chat_template_kwargs: dict[str, Any] | None = None,
+    ):
         self._tokenizer = tokenizer
+        self._processor = processor
+        self._tool_parser = tool_parser
+        self._apply_chat_template_kwargs = dict(apply_chat_template_kwargs or {})
         self._backend = backend
         self._host = host
         self._sessions: dict[str, GatewaySessionState] = {}
@@ -150,7 +164,6 @@ class _GatewayActor:
         self._server_port: int | None = None
         self._server_task: asyncio.Task | None = None
         self._server_base_url: str | None = None
-        self._terminal_session_phases: dict[str, SessionPhase] = {}
         self._register_routes()
 
     def _register_routes(self) -> None:
@@ -176,22 +189,9 @@ class _GatewayActor:
             raise KeyError(f"Unknown session_id: {session_id}")
         return session
 
-    def _get_terminal_phase(self, session_id: str) -> SessionPhase | None:
-        return self._terminal_session_phases.get(session_id)
-
-    def _raise_if_terminal(self, session_id: str) -> None:
-        terminal_phase = self._get_terminal_phase(session_id)
-        if terminal_phase is not None:
-            raise RuntimeError(f"Session {session_id} is {terminal_phase.value.lower()}")
-
     def _set_phase(self, session: GatewaySessionState, phase: SessionPhase) -> None:
         session.phase = phase
-        session.completed_flag = phase == SessionPhase.COMPLETED
-        session.aborted_flag = phase == SessionPhase.ABORTED
         self._touch_session(session)
-
-    def _mark_terminal(self, session_id: str, phase: SessionPhase) -> None:
-        self._terminal_session_phases[session_id] = phase
 
     def _touch_session(self, session: GatewaySessionState) -> None:
         session.updated_at = time.time()
@@ -218,6 +218,171 @@ class _GatewayActor:
         session.next_trajectory_id += 1
         session.active_trajectory = None
 
+    def _collect_multimodal_data(self, messages: list[dict[str, Any]]) -> tuple[list[Any] | None, list[Any] | None]:
+        images: list[Any] = []
+        videos: list[Any] = []
+        for message in messages:
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                part_type = part.get("type")
+                if part_type == "image":
+                    value = part.get("image", part.get("images"))
+                    if value is None:
+                        continue
+                    if isinstance(value, list):
+                        images.extend(value)
+                    else:
+                        images.append(value)
+                elif part_type == "video":
+                    value = part.get("video", part.get("videos"))
+                    if value is None:
+                        continue
+                    if isinstance(value, list):
+                        videos.extend(value)
+                    else:
+                        videos.append(value)
+        return (images or None, videos or None)
+
+    def _render_chat_template(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: list[dict[str, Any]] | None,
+        add_generation_prompt: bool,
+    ) -> str:
+        template_target = self._processor or self._tokenizer
+        return apply_chat_template(
+            template_target,
+            messages,
+            tools=tools,
+            add_generation_prompt=add_generation_prompt,
+            tokenize=False,
+            **self._apply_chat_template_kwargs,
+        )
+
+    def _tokenize_prompt(
+        self,
+        rendered_prompt: str,
+        *,
+        images: list[Any] | None,
+        videos: list[Any] | None,
+    ) -> list[int]:
+        if self._processor is None:
+            return list(normalize_token_ids(self._tokenizer.encode(rendered_prompt, add_special_tokens=False)))
+
+        video_inputs = None
+        video_metadata = None
+        if videos is not None:
+            if videos and isinstance(videos[0], tuple):
+                video_inputs, video_metadata = zip(*videos, strict=False)
+                video_inputs = list(video_inputs)
+                video_metadata = list(video_metadata)
+            else:
+                video_inputs = videos
+
+        model_inputs = self._processor(
+            text=[rendered_prompt],
+            images=images,
+            videos=video_inputs,
+            video_metadata=video_metadata,
+            return_tensors="pt",
+            do_sample_frames=False,
+        )
+        return list(model_inputs["input_ids"][0].tolist())
+
+    def _encode_full_prompt(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+    ) -> tuple[list[int], list[Any] | None, list[Any] | None]:
+        images, videos = self._collect_multimodal_data(messages)
+        rendered_prompt = self._render_chat_template(messages, tools=tools, add_generation_prompt=True)
+        return self._tokenize_prompt(rendered_prompt, images=images, videos=videos), images, videos
+
+    def _encode_prompt_delta(
+        self,
+        *,
+        previous_messages: list[dict[str, Any]],
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+    ) -> tuple[list[int], list[Any] | None, list[Any] | None]:
+        prev_images, prev_videos = self._collect_multimodal_data(previous_messages)
+        curr_images, curr_videos = self._collect_multimodal_data(messages)
+        prev_rendered = self._render_chat_template(previous_messages, tools=tools, add_generation_prompt=False)
+        curr_rendered = self._render_chat_template(messages, tools=tools, add_generation_prompt=True)
+
+        if self._processor is None:
+            delta_text = curr_rendered[len(prev_rendered) :]
+            delta_ids = normalize_token_ids(self._tokenizer.encode(delta_text, add_special_tokens=False))
+            return list(delta_ids), curr_images, curr_videos
+
+        prev_ids = self._tokenize_prompt(prev_rendered, images=prev_images, videos=prev_videos)
+        curr_ids = self._tokenize_prompt(curr_rendered, images=curr_images, videos=curr_videos)
+        return curr_ids[len(prev_ids) :], curr_images, curr_videos
+
+    def _format_tool_calls(self, parsed_tool_calls: Any) -> list[dict[str, Any]]:
+        formatted_tool_calls: list[dict[str, Any]] = []
+        for index, tool_call in enumerate(parsed_tool_calls):
+            if isinstance(tool_call, dict) and "function" in tool_call:
+                function = tool_call["function"]
+                formatted_tool_calls.append(
+                    {
+                        "id": str(tool_call.get("id", f"call-{index}")),
+                        "type": str(tool_call.get("type", "function")),
+                        "function": {
+                            "name": str(function.get("name", "")),
+                            "arguments": str(function.get("arguments", "")),
+                        },
+                    }
+                )
+                continue
+
+            formatted_tool_calls.append(
+                {
+                    "id": f"call-{index}",
+                    "type": "function",
+                    "function": {
+                        "name": str(getattr(tool_call, "name", "")),
+                        "arguments": str(getattr(tool_call, "arguments", "")),
+                    },
+                }
+            )
+        return formatted_tool_calls
+
+    async def _decode_assistant_message(
+        self,
+        *,
+        response_ids: list[int],
+        tools: list[dict[str, Any]] | None,
+    ) -> tuple[dict[str, Any], dict[str, Any], str]:
+        response_text = self._tokenizer.decode(response_ids)
+        if self._tool_parser is None:
+            assistant_message = {"role": "assistant", "content": response_text}
+            return assistant_message, dict(assistant_message), "stop"
+
+        content, parsed_tool_calls = await self._tool_parser.extract_tool_calls(response_ids, tools=tools)
+        formatted_tool_calls = self._format_tool_calls(parsed_tool_calls)
+        if not formatted_tool_calls:
+            assistant_message = {"role": "assistant", "content": content}
+            return assistant_message, dict(assistant_message), "stop"
+
+        assistant_message = {
+            "role": "assistant",
+            "content": content,
+            "tool_calls": formatted_tool_calls,
+        }
+        history_message = {
+            "role": "assistant",
+            "content": content,
+            "tool_calls": _normalize_tool_calls(formatted_tool_calls),
+        }
+        return assistant_message, history_message, "tool_calls"
+
     def _build_materialized_trajectory(
         self,
         *,
@@ -237,18 +402,19 @@ class _GatewayActor:
             num_turns=len(session.message_history),
         )
 
-    def _start_new_trajectory(self, session: GatewaySessionState, messages: list[dict[str, Any]]) -> None:
-        prompt_ids = list(self._tokenizer.encode_messages(messages, add_generation_prompt=True))
+    def _start_new_trajectory(
+        self,
+        session: GatewaySessionState,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+    ) -> None:
+        prompt_ids, _, _ = self._encode_full_prompt(messages=messages, tools=tools)
         session.active_trajectory = TrajectoryBuffer(prompt_ids=prompt_ids)
 
     async def _handle_chat_completions(self, session_id: str, payload: dict[str, Any]) -> JSONResponse:
         try:
             session = self._get_session(session_id)
         except KeyError as exc:
-            #TODO: check if terminal_phase is a useful variable in addition to session.phase
-            terminal_phase = self._get_terminal_phase(session_id)
-            if terminal_phase is not None:
-                raise HTTPException(status_code=409, detail=f"Session {session_id} is {terminal_phase.value.lower()}") from exc
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
         async with session.request_lock:
@@ -269,18 +435,19 @@ class _GatewayActor:
             # TODO: check if tentative trajectories are necessary
             tentative_trajectories = list(session.trajectories)
             tentative_next_trajectory_id = session.next_trajectory_id
+            prompt_images = None
+            prompt_videos = None
 
             if session.active_trajectory is None:
-                tentative_active = TrajectoryBuffer(
-                    prompt_ids=list(self._tokenizer.encode_messages(messages, add_generation_prompt=True))
-                )
+                prompt_ids, prompt_images, prompt_videos = self._encode_full_prompt(messages=messages, tools=tools)
+                tentative_active = TrajectoryBuffer(prompt_ids=prompt_ids)
             elif _is_request_context_prefix(session=session, messages=messages, tools=tools):
                 tentative_active = _copy_trajectory_buffer(session.active_trajectory)
-                incremental_messages = messages[len(session.message_history) :]
-                if incremental_messages:
-                    incremental_ids = list(
-                        #TODO: encoding behavior needs to be extended to handle multimodal data and tool calls
-                        self._tokenizer.encode_messages(incremental_messages, add_generation_prompt=True)
+                if len(messages) > len(session.message_history):
+                    incremental_ids, prompt_images, prompt_videos = self._encode_prompt_delta(
+                        previous_messages=session.message_history,
+                        messages=messages,
+                        tools=tools,
                     )
                     tentative_active.response_ids.extend(incremental_ids)
                     tentative_active.response_mask.extend([0] * len(incremental_ids))
@@ -294,9 +461,8 @@ class _GatewayActor:
                     )
                 )
                 tentative_next_trajectory_id += 1
-                tentative_active = TrajectoryBuffer(
-                    prompt_ids=list(self._tokenizer.encode_messages(messages, add_generation_prompt=True))
-                )
+                prompt_ids, prompt_images, prompt_videos = self._encode_full_prompt(messages=messages, tools=tools)
+                tentative_active = TrajectoryBuffer(prompt_ids=prompt_ids)
 
             # TODO: prompt_ids for generate requests are different from those in trajectories, shall we use different variable names?
             prompt_ids = tentative_active.prompt_ids + tentative_active.response_ids
@@ -309,6 +475,8 @@ class _GatewayActor:
                 request_id=session_id,
                 prompt_ids=prompt_ids,
                 sampling_params=sampling_params,
+                image_data=prompt_images,
+                video_data=prompt_videos,
             )
 
             response_ids = list(output.token_ids)
@@ -319,12 +487,14 @@ class _GatewayActor:
             else:
                 tentative_active.response_logprobs.extend([0.0] * len(response_ids))
 
-            # TODO: decode behavior needs to be extended to handle tool calls (and multimodal data??)
-            response_text = self._tokenizer.decode(response_ids)
+            assistant_message, history_message, finish_reason = await self._decode_assistant_message(
+                response_ids=response_ids,
+                tools=tools,
+            )
             session.trajectories = tentative_trajectories
             session.next_trajectory_id = tentative_next_trajectory_id
             session.active_trajectory = tentative_active
-            session.message_history = messages + [{"role": "assistant", "content": response_text}]
+            session.message_history = messages + [history_message]
             session.request_tools = tools
             self._touch_session(session)
 
@@ -335,11 +505,8 @@ class _GatewayActor:
                     "choices": [
                         {
                             "index": 0,
-                            "message": {
-                                "role": "assistant",
-                                "content": response_text,
-                            },
-                            "finish_reason": output.stop_reason or "stop",
+                            "message": assistant_message,
+                            "finish_reason": output.stop_reason or finish_reason,
                         }
                     ],
                     # TODO: Is this needed?
@@ -371,7 +538,7 @@ class _GatewayActor:
 
     async def create_session(self, session_id: str, metadata: dict[str, Any] | None = None) -> SessionHandle:
         self._require_started()
-        if session_id in self._sessions or session_id in self._terminal_session_phases:
+        if session_id in self._sessions:
             raise RuntimeError(f"Session {session_id} already exists")
 
         handle = SessionHandle(
@@ -382,7 +549,6 @@ class _GatewayActor:
         return handle
 
     async def complete_session(self, session_id: str, reward_info: dict[str, Any] | None = None) -> None:
-        self._raise_if_terminal(session_id)
         session = self._get_session(session_id)
         async with session.request_lock:
             # Accommodate retry attempts
@@ -409,7 +575,6 @@ class _GatewayActor:
         return
 
     async def finalize_session(self, session_id: str) -> list[Trajectory]:
-        self._raise_if_terminal(session_id)
         session = self._get_session(session_id)
         async with session.request_lock:
             if session.phase == SessionPhase.ABORTED:
@@ -423,30 +588,19 @@ class _GatewayActor:
             session.completed.set()
             trajectories = [replace(trajectory, reward_info=dict(session.reward_info)) for trajectory in session.trajectories]
             self._sessions.pop(session_id, None)
-            self._mark_terminal(session_id, SessionPhase.FINALIZED)
             return trajectories
 
     async def abort_session(self, session_id: str) -> None:
-        terminal_phase = self._get_terminal_phase(session_id)
-        if terminal_phase == SessionPhase.ABORTED:
-            return
-        if terminal_phase == SessionPhase.FINALIZED:
-            raise RuntimeError(f"Session {session_id} is finalized")
-
         session = self._get_session(session_id)
         async with session.request_lock:
             if session.phase == SessionPhase.ABORTED:
                 return
-            # TODO: if the finalize behavior pops the current session from self._sessions, 
-            # is session.phase==FINALIZED still a legit state?
-            # Same question for ABORTED
             if session.phase == SessionPhase.FINALIZED:
                 raise RuntimeError(f"Session {session_id} is finalized")
 
             self._set_phase(session, SessionPhase.ABORTED)
             session.completed.set()
             self._sessions.pop(session_id, None)
-            self._mark_terminal(session_id, SessionPhase.ABORTED)
 
     async def get_session_state(self, session_id: str) -> dict[str, Any]:
         session = self._get_session(session_id)
@@ -454,9 +608,6 @@ class _GatewayActor:
             "session_id": session.handle.session_id,
             "metadata": dict(session.metadata),
             "phase": session.phase.value,
-            # TODO: are completed_flag and aborted_flag redundant?
-            "completed_flag": session.completed_flag,
-            "aborted_flag": session.aborted_flag,
             "created_at": session.created_at,
             "updated_at": session.updated_at,
             "num_trajectories": len(session.trajectories),
