@@ -101,7 +101,8 @@ def _get_rollout_and_model_config(config: DictConfig) -> tuple[DictConfig, DictC
     else:
         return config.rollout, config.model
 
-
+#TODO: this base class includes only gateway-related functionalities but named LLMServerManager
+#      is this the correct abstraction? Shall we change it to a mixin?
 class LLMServerManager:
     """Own rollout serving handles and optional gateway-backed session runtime."""
 
@@ -284,7 +285,7 @@ class AsyncLLMServerManager(LLMServerManager):
         finally:
             self._release_server(server_id)
 
-
+# TODO: check if this wrapper is necessary at all.
 class _GatewayServingBackend:
     """Gateway-facing serving adapter owned and constructed by AsyncLLMServerManager."""
 

@@ -7,11 +7,11 @@ from verl.protocol import DataProto
 from .assembler import TrajectoryAssembler
 from .framework import AgentFramework
 
-
+# TODO: shall we put this in the framework module?
 class OpenAICompatibleAgentFramework(AgentFramework):
     def __init__(
         self,
-        session_runtime,
+        session_runtime, # TODO: confusing variable name, unify this with the LLMServer class in agent_loop.py
         agent_runner,
         *,
         assembler: TrajectoryAssembler | None = None,
@@ -27,10 +27,8 @@ class OpenAICompatibleAgentFramework(AgentFramework):
         self.wait_for_completion_after_agent_run = wait_for_completion_after_agent_run
 
     async def generate_sequences(self, prompts: DataProto) -> DataProto:
-        if len(prompts) == 0:
-            return DataProto()
-
         raw_prompts = prompts.non_tensor_batch.get("raw_prompt")
+        # TODO: shall we allow token ids as input?
         if raw_prompts is None:
             raise ValueError("OpenAICompatibleAgentFramework requires non_tensor_batch['raw_prompt']")
 
