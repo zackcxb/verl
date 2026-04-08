@@ -232,6 +232,27 @@ class AssertingQueuedBackend:
         )
 
 
+class FailOnCallBackend:
+    def __init__(self, responses, fail_on_call: int):
+        self._responses = list(responses)
+        self._fail_on_call = fail_on_call
+        self.calls = 0
+
+    async def generate(self, request_id, *, prompt_ids, sampling_params, image_data=None, video_data=None):
+        if self.calls == self._fail_on_call:
+            self.calls += 1
+            raise RuntimeError(f"backend failure on call {self._fail_on_call}")
+
+        text = self._responses.pop(0)
+        self.calls += 1
+        token_ids = [ord(char) for char in text]
+        return TokenOutput(
+            token_ids=token_ids,
+            log_probs=[-0.1] * len(token_ids),
+            stop_reason="completed",
+        )
+
+
 @ray.remote
 class FlakyGatewayActor:
     def __init__(self, fail_finalize_once: bool = False, fail_abort_once: bool = False):

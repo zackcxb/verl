@@ -6,6 +6,7 @@ import ray
 
 from tests.experimental.agent_gateway.support import (
     AssertingQueuedBackend,
+    FailOnCallBackend,
     FakeDeltaTokenizer,
     FakeProcessor,
     FakeTokenizer,
@@ -196,6 +197,45 @@ async def test_gateway_actor_serializes_same_session_concurrent_requests(ray_run
     assert trajectories[1].response_ids == [ord(char) for char in "SECOND"]
     assert trajectories[0].response_mask == [1] * len("FIRST")
     assert trajectories[1].response_mask == [1] * len("SECOND")
+
+
+@pytest.mark.asyncio
+async def test_gateway_actor_failed_request_keeps_previous_active_trajectory(ray_runtime):
+    from verl.experimental.agent_gateway.gateway import GatewayActor
+
+    actor = GatewayActor.remote(
+        tokenizer=FakeTokenizer(),
+        backend=FailOnCallBackend(["FIRST"], fail_on_call=1),
+        host="127.0.0.1",
+    )
+    ray.get(actor.start.remote())
+    session = ray.get(actor.create_session.remote("session-failed-request"))
+
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        first = await client.post(
+            f"{session.base_url}/chat/completions",
+            json={
+                "model": "dummy-model",
+                "messages": [{"role": "user", "content": "first turn"}],
+            },
+        )
+        assert first.status_code == 200
+
+        second = await client.post(
+            f"{session.base_url}/chat/completions",
+            json={
+                "model": "dummy-model",
+                "messages": [{"role": "user", "content": "replacement context"}],
+            },
+        )
+        assert second.status_code == 500
+
+    trajectories = ray.get(actor.finalize_session.remote("session-failed-request"))
+    ray.get(actor.shutdown.remote())
+
+    assert len(trajectories) == 1
+    assert trajectories[0].trajectory_id == 0
+    assert trajectories[0].response_ids == [ord(char) for char in "FIRST"]
 
 
 @pytest.mark.asyncio

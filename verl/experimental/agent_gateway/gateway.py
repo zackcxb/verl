@@ -418,7 +418,6 @@ class _GatewayActor:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
         async with session.request_lock:
-            # TODO: may be a dead branch after the terminal phase check
             if session.phase != SessionPhase.ACTIVE:
                 raise HTTPException(status_code=409, detail=f"Session {session_id} is {session.phase.value.lower()}")
 
@@ -432,40 +431,37 @@ class _GatewayActor:
 
             messages = request_context["messages"]
             tools = request_context["tools"]
-            # TODO: check if tentative trajectories are necessary
-            tentative_trajectories = list(session.trajectories)
-            tentative_next_trajectory_id = session.next_trajectory_id
+            next_trajectory_id = session.next_trajectory_id
+            materialized_trajectory = None
             prompt_images = None
             prompt_videos = None
 
             if session.active_trajectory is None:
                 prompt_ids, prompt_images, prompt_videos = self._encode_full_prompt(messages=messages, tools=tools)
-                tentative_active = TrajectoryBuffer(prompt_ids=prompt_ids)
+                active_trajectory = TrajectoryBuffer(prompt_ids=prompt_ids)
             elif _is_request_context_prefix(session=session, messages=messages, tools=tools):
-                tentative_active = _copy_trajectory_buffer(session.active_trajectory)
+                active_trajectory = _copy_trajectory_buffer(session.active_trajectory)
                 if len(messages) > len(session.message_history):
                     incremental_ids, prompt_images, prompt_videos = self._encode_prompt_delta(
                         previous_messages=session.message_history,
                         messages=messages,
                         tools=tools,
                     )
-                    tentative_active.response_ids.extend(incremental_ids)
-                    tentative_active.response_mask.extend([0] * len(incremental_ids))
-                    tentative_active.response_logprobs.extend([0.0] * len(incremental_ids))
+                    active_trajectory.response_ids.extend(incremental_ids)
+                    active_trajectory.response_mask.extend([0] * len(incremental_ids))
+                    active_trajectory.response_logprobs.extend([0.0] * len(incremental_ids))
             else:
-                tentative_trajectories.append(
-                    self._build_materialized_trajectory(
-                        session=session,
-                        active=session.active_trajectory,
-                        trajectory_id=tentative_next_trajectory_id,
-                    )
+                materialized_trajectory = self._build_materialized_trajectory(
+                    session=session,
+                    active=session.active_trajectory,
+                    trajectory_id=next_trajectory_id,
                 )
-                tentative_next_trajectory_id += 1
+                next_trajectory_id += 1
                 prompt_ids, prompt_images, prompt_videos = self._encode_full_prompt(messages=messages, tools=tools)
-                tentative_active = TrajectoryBuffer(prompt_ids=prompt_ids)
+                active_trajectory = TrajectoryBuffer(prompt_ids=prompt_ids)
 
             # TODO: prompt_ids for generate requests are different from those in trajectories, shall we use different variable names?
-            prompt_ids = tentative_active.prompt_ids + tentative_active.response_ids
+            prompt_ids = active_trajectory.prompt_ids + active_trajectory.response_ids
             sampling_params = dict(payload)
             # TODO: check if there are other fields that need to be popped
             sampling_params.pop("messages", None)
@@ -480,20 +476,21 @@ class _GatewayActor:
             )
 
             response_ids = list(output.token_ids)
-            tentative_active.response_ids.extend(response_ids)
-            tentative_active.response_mask.extend([1] * len(response_ids))
+            active_trajectory.response_ids.extend(response_ids)
+            active_trajectory.response_mask.extend([1] * len(response_ids))
             if output.log_probs is not None:
-                tentative_active.response_logprobs.extend(list(output.log_probs))
+                active_trajectory.response_logprobs.extend(list(output.log_probs))
             else:
-                tentative_active.response_logprobs.extend([0.0] * len(response_ids))
+                active_trajectory.response_logprobs.extend([0.0] * len(response_ids))
 
             assistant_message, history_message, finish_reason = await self._decode_assistant_message(
                 response_ids=response_ids,
                 tools=tools,
             )
-            session.trajectories = tentative_trajectories
-            session.next_trajectory_id = tentative_next_trajectory_id
-            session.active_trajectory = tentative_active
+            if materialized_trajectory is not None:
+                session.trajectories.append(materialized_trajectory)
+            session.next_trajectory_id = next_trajectory_id
+            session.active_trajectory = active_trajectory
             session.message_history = messages + [history_message]
             session.request_tools = tools
             self._touch_session(session)
