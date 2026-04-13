@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-from verl.experimental.agent_framework.types import SessionHandle, Trajectory
+from verl.agent.framework.types import SessionHandle, Trajectory
 
 
 class SessionPhase(str, Enum):

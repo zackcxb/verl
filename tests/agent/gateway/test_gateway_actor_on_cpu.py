@@ -4,7 +4,7 @@ import httpx
 import pytest
 import ray
 
-from tests.experimental.agent_gateway.support import (
+from tests.agent.support import (
     FailingBackend,
     FakeTokenizer,
     QueuedBackend,
@@ -22,7 +22,7 @@ def ray_runtime():
 
 
 def test_normalize_request_context_preserves_structured_fields():
-    from verl.experimental.agent_gateway.gateway import _normalize_request_context
+    from verl.agent.gateway.gateway import _normalize_request_context
 
     context = _normalize_request_context(
         {
@@ -66,7 +66,7 @@ def test_normalize_request_context_preserves_tool_argument_strings():
     format drift (e.g. JSON key reorder by the agent) is treated as a
     context change.
     """
-    from verl.experimental.agent_gateway.gateway import _normalize_request_context
+    from verl.agent.gateway.gateway import _normalize_request_context
 
     context = _normalize_request_context(
         {
@@ -95,7 +95,7 @@ def test_normalize_request_context_preserves_tool_argument_strings():
 
 @pytest.mark.asyncio
 async def test_gateway_actor_complete_wait_and_finalize(ray_runtime):
-    from verl.experimental.agent_gateway.gateway import GatewayActor
+    from verl.agent.gateway.gateway import GatewayActor
 
     actor = GatewayActor.remote(tokenizer=FakeTokenizer(), backend=QueuedBackend(["ANSWER: A"]), host="127.0.0.1")
     ray.get(actor.start.remote())
@@ -133,7 +133,7 @@ async def test_gateway_actor_complete_wait_and_finalize(ray_runtime):
 
 @pytest.mark.asyncio
 async def test_gateway_actor_prefix_mismatch_splits_trajectories(ray_runtime):
-    from verl.experimental.agent_gateway.gateway import GatewayActor
+    from verl.agent.gateway.gateway import GatewayActor
 
     actor = GatewayActor.remote(tokenizer=FakeTokenizer(), backend=QueuedBackend(["FIRST", "SECOND"]), host="127.0.0.1")
     ray.get(actor.start.remote())
@@ -169,7 +169,7 @@ async def test_gateway_actor_prefix_mismatch_splits_trajectories(ray_runtime):
 
 @pytest.mark.asyncio
 async def test_gateway_actor_tool_context_change_splits_trajectory(ray_runtime):
-    from verl.experimental.agent_gateway.gateway import GatewayActor
+    from verl.agent.gateway.gateway import GatewayActor
 
     actor = GatewayActor.remote(tokenizer=FakeTokenizer(), backend=QueuedBackend(["FIRST", "SECOND"]), host="127.0.0.1")
     ray.get(actor.start.remote())
@@ -209,7 +209,7 @@ async def test_gateway_actor_tool_context_change_splits_trajectory(ray_runtime):
 
 @pytest.mark.asyncio
 async def test_gateway_actor_does_not_forward_tools_in_sampling_params(ray_runtime):
-    from verl.experimental.agent_gateway.gateway import GatewayActor
+    from verl.agent.gateway.gateway import GatewayActor
 
     actor = GatewayActor.remote(
         tokenizer=FakeTokenizer(),
@@ -236,7 +236,7 @@ async def test_gateway_actor_does_not_forward_tools_in_sampling_params(ray_runti
 
 @pytest.mark.asyncio
 async def test_gateway_actor_continuation_preserves_prompt_and_generation_masks(ray_runtime):
-    from verl.experimental.agent_gateway.gateway import GatewayActor
+    from verl.agent.gateway.gateway import GatewayActor
 
     actor = GatewayActor.remote(tokenizer=FakeTokenizer(), backend=QueuedBackend(["FIRST", "SECOND"]), host="127.0.0.1")
     ray.get(actor.start.remote())
@@ -278,7 +278,7 @@ async def test_gateway_actor_continuation_preserves_prompt_and_generation_masks(
     assert trajectories[0].response_mask[-len("SECOND") :] == [1] * len("SECOND")
 @pytest.mark.asyncio
 async def test_gateway_actor_serializes_same_session_concurrent_requests(ray_runtime):
-    from verl.experimental.agent_gateway.gateway import GatewayActor
+    from verl.agent.gateway.gateway import GatewayActor
 
     actor = GatewayActor.remote(
         tokenizer=FakeTokenizer(),
@@ -312,7 +312,7 @@ async def test_gateway_actor_serializes_same_session_concurrent_requests(ray_run
     assert trajectories[1].response_mask == [1] * len("SECOND")
 @pytest.mark.asyncio
 async def test_gateway_actor_rejects_chat_after_complete(ray_runtime):
-    from verl.experimental.agent_gateway.gateway import GatewayActor
+    from verl.agent.gateway.gateway import GatewayActor
 
     actor = GatewayActor.remote(tokenizer=FakeTokenizer(), backend=QueuedBackend(["DONE"]), host="127.0.0.1")
     ray.get(actor.start.remote())
@@ -332,7 +332,7 @@ async def test_gateway_actor_rejects_chat_after_complete(ray_runtime):
 
 @pytest.mark.asyncio
 async def test_gateway_actor_rejects_invalid_requests_with_bad_request(ray_runtime):
-    from verl.experimental.agent_gateway.gateway import GatewayActor
+    from verl.agent.gateway.gateway import GatewayActor
 
     actor = GatewayActor.remote(tokenizer=FakeTokenizer(), backend=QueuedBackend(["DONE"]), host="127.0.0.1")
     ray.get(actor.start.remote())
@@ -356,7 +356,7 @@ async def test_gateway_actor_rejects_invalid_requests_with_bad_request(ray_runti
 
 @pytest.mark.asyncio
 async def test_gateway_actor_backend_failure_does_not_commit_partial_state(ray_runtime):
-    from verl.experimental.agent_gateway.gateway import GatewayActor
+    from verl.agent.gateway.gateway import GatewayActor
 
     actor = GatewayActor.remote(tokenizer=FakeTokenizer(), backend=FailingBackend("boom"), host="127.0.0.1")
     ray.get(actor.start.remote())
@@ -378,7 +378,7 @@ async def test_gateway_actor_backend_failure_does_not_commit_partial_state(ray_r
 
 @pytest.mark.asyncio
 async def test_gateway_actor_backend_failure_after_tool_mismatch_does_not_split(ray_runtime):
-    from verl.experimental.agent_gateway.gateway import GatewayActor
+    from verl.agent.gateway.gateway import GatewayActor
 
     actor = GatewayActor.remote(
         tokenizer=FakeTokenizer(),
@@ -427,7 +427,7 @@ async def test_gateway_actor_backend_failure_after_tool_mismatch_does_not_split(
 async def test_gateway_actor_tool_call_decode_returns_openai_format(ray_runtime):
     """When tool_parser_name is set and model outputs tool call tokens,
     the HTTP response should contain tool_calls in OpenAI format."""
-    from verl.experimental.agent_gateway.gateway import GatewayActor
+    from verl.agent.gateway.gateway import GatewayActor
 
     tool_call_text = '<tool_call>\n{"name": "search", "arguments": {"query": "weather"}}\n</tool_call>'
     actor = GatewayActor.remote(

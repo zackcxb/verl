@@ -6,7 +6,7 @@ import numpy as np
 import torch
 from tensordict import TensorDict
 
-from verl.protocol import DataProto
+from verl.utils import tensordict_utils as tu
 from verl.utils.model import compute_position_id_with_mask
 
 from .helpers import normalize_trajectory_rewards, validate_trajectory
@@ -24,7 +24,7 @@ class TrajectoryAssembler:
     def __init__(self, pad_token_id: int = 0):
         self.pad_token_id = pad_token_id
 
-    def assemble(self, trajectories: Sequence[Trajectory]) -> DataProto:
+    def assemble(self, trajectories: Sequence[Trajectory]) -> TensorDict:
         if not trajectories:
             raise ValueError("trajectories must be non-empty")
 
@@ -112,20 +112,17 @@ class TrajectoryAssembler:
             )
         )
 
-        non_tensor_batch: dict[str, np.ndarray] = {
-            "__num_turns__": np.array([trajectory.num_turns for trajectory in normalized], dtype=np.int32),
+        batch_non_tensors: dict[str, list[object]] = {
+            "__num_turns__": [int(trajectory.num_turns) for trajectory in normalized],
         }
         for key in reward_extra_keys:
-            values = np.empty(batch_size, dtype=object)
-            values[:] = [trajectory.reward_info.get(key) for trajectory in normalized]
-            non_tensor_batch[key] = values
+            batch_non_tensors[key] = [trajectory.reward_info.get(key) for trajectory in normalized]
 
-        meta_info: dict[str, object] = {}
+        non_tensor_metadata: dict[str, object] = {}
         if "rm_scores" in batch_tensors:
-            meta_info["reward_extra_keys"] = reward_extra_keys
+            non_tensor_metadata["reward_extra_keys"] = reward_extra_keys
 
-        return DataProto(
-            batch=TensorDict(batch_tensors, batch_size=batch_size),
-            non_tensor_batch=non_tensor_batch,
-            meta_info=meta_info,
+        return tu.get_tensordict(
+            tensor_dict=batch_tensors | batch_non_tensors,
+            non_tensor_dict=non_tensor_metadata,
         )

@@ -2,7 +2,7 @@ import asyncio
 
 import ray
 
-from verl.experimental.agent_framework.types import SessionHandle, Trajectory
+from verl.agent.framework.types import SessionHandle, Trajectory
 from verl.workers.rollout.replica import TokenOutput
 
 

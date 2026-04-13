@@ -6,9 +6,11 @@ from abc import ABC, abstractmethod
 from dataclasses import replace
 from uuid import uuid4
 
-import numpy as np
+import torch
+from tensordict import TensorDict
+from tensordict.tensorclass import NonTensorData, NonTensorStack
 
-from verl.protocol import DataProto
+from verl.utils import tensordict_utils as tu
 
 from .assembler import TrajectoryAssembler
 from .types import RewardFn, SessionRewardContext, SessionRuntime, Trajectory
@@ -16,17 +18,15 @@ from .types import RewardFn, SessionRewardContext, SessionRuntime, Trajectory
 
 class AgentFramework(ABC):
     @abstractmethod
-    async def generate_sequences(self, prompts: DataProto) -> DataProto:
-        """Process a trainer batch and return a training-ready DataProto."""
+    async def generate_sequences(self, prompts: TensorDict) -> TensorDict:
+        """Process a trainer batch and return a training-ready TensorDict."""
         ...
 
 
-def _broadcast_sample_non_tensor_fields(sample_fields: dict[str, object], repeat_count: int) -> dict[str, np.ndarray]:
-    broadcasted: dict[str, np.ndarray] = {}
+def _broadcast_sample_non_tensor_fields(sample_fields: dict[str, object], repeat_count: int) -> dict[str, list[object]]:
+    broadcasted: dict[str, list[object]] = {}
     for key, value in sample_fields.items():
-        values = np.empty(repeat_count, dtype=object)
-        values[:] = [value] * repeat_count
-        broadcasted[key] = values
+        broadcasted[key] = [value] * repeat_count
     return broadcasted
 
 
@@ -37,7 +37,7 @@ class OpenAICompatibleAgentFramework(AgentFramework):
     communicates with the Gateway via standard ``/v1/chat/completions``
     requests, and the Gateway collects token-level trajectories.  After
     finalization, ``reward_fn`` scores the session's trajectories and the
-    assembler packs everything into a training-ready ``DataProto``.
+    assembler packs everything into a training-ready ``TensorDict``.
     """
 
     def __init__(
@@ -58,12 +58,12 @@ class OpenAICompatibleAgentFramework(AgentFramework):
         self.completion_timeout = completion_timeout
         self.wait_for_completion_after_agent_run = wait_for_completion_after_agent_run
 
-    async def generate_sequences(self, prompts: DataProto) -> DataProto:
+    async def generate_sequences(self, prompts: TensorDict) -> TensorDict:
         assert len(prompts) > 0, "generate_sequences requires a non-empty batch"
 
-        raw_prompts = prompts.non_tensor_batch.get("raw_prompt")
+        raw_prompts = tu.get(prompts, "raw_prompt")
         if raw_prompts is None:
-            raise ValueError("OpenAICompatibleAgentFramework requires non_tensor_batch['raw_prompt']")
+            raise ValueError("OpenAICompatibleAgentFramework requires prompts['raw_prompt']")
 
         tasks = [
             self._run_session(prompts=prompts, raw_prompt=raw_prompts[i], sample_index=i)
@@ -78,25 +78,27 @@ class OpenAICompatibleAgentFramework(AgentFramework):
             if not session_trajectories:
                 continue
             for key, values in _broadcast_sample_non_tensor_fields(sample_fields, len(session_trajectories)).items():
-                expanded_non_tensor_batch.setdefault(key, []).extend(values.tolist())
+                expanded_non_tensor_batch.setdefault(key, []).extend(values)
 
         assembled = self.assembler.assemble(all_trajectories)
-        merged_non_tensor_batch = {
-            key: np.array(values, dtype=object)
-            for key, values in expanded_non_tensor_batch.items()
-        }
-        merged_non_tensor_batch.update(assembled.non_tensor_batch)
-        return DataProto(
-            batch=assembled.batch,
-            non_tensor_batch=merged_non_tensor_batch,
-            meta_info=assembled.meta_info,
-        )
+        result = assembled.copy()
+        for key, values in expanded_non_tensor_batch.items():
+            tu.assign_non_tensor(result, **{key: values})
+        return result
 
     async def _run_session(
-        self, *, prompts: DataProto, raw_prompt, sample_index: int,
+        self, *, prompts: TensorDict, raw_prompt, sample_index: int,
     ) -> tuple[list[Trajectory], dict[str, object]]:
         session_id = self._build_session_id(prompts=prompts, sample_index=sample_index)
-        sample_fields = {k: v[sample_index] for k, v in prompts.non_tensor_batch.items()}
+        sample_fields = {}
+        for key, value in prompts.items():
+            if isinstance(value, torch.Tensor):
+                sample_fields[key] = value[sample_index]
+            elif isinstance(value, NonTensorStack):
+                sample_fields[key] = tu.get(prompts, key)[sample_index]
+            else:
+                assert isinstance(value, NonTensorData)
+                sample_fields[key] = value.data
         session = await self.session_runtime.create_session(session_id)
         try:
             await self.agent_runner(
@@ -136,5 +138,5 @@ class OpenAICompatibleAgentFramework(AgentFramework):
             sample_fields,
         )
 
-    def _build_session_id(self, prompts: DataProto, sample_index: int) -> str:
+    def _build_session_id(self, prompts: TensorDict, sample_index: int) -> str:
         return f"session-{sample_index}-{uuid4().hex}"
