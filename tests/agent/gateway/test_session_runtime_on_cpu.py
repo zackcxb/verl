@@ -2,7 +2,7 @@ import httpx
 import pytest
 import ray
 
-from tests.experimental.agent_gateway.support import (
+from tests.agent.support import (
     FakeTokenizer,
     QueuedBackend,
     RecordingLoadBalancer,
@@ -18,11 +18,10 @@ def ray_runtime():
 
 
 @pytest.mark.asyncio
-async def test_async_llm_server_manager_owns_gateway_lifecycle_and_session_runtime(ray_runtime):
-    from verl.experimental.agent_loop.agent_loop import AsyncLLMServerManager
+async def test_gateway_serving_runtime_owns_gateway_lifecycle_and_session_runtime(ray_runtime):
+    from verl.agent.gateway.runtime import GatewayServingRuntime
 
-    manager = AsyncLLMServerManager(
-        config=None,
+    runtime = GatewayServingRuntime(
         servers=[],
         load_balancer_handle=None,
         gateway_count=1,
@@ -33,8 +32,8 @@ async def test_async_llm_server_manager_owns_gateway_lifecycle_and_session_runti
         },
     )
 
-    session = await manager.create_session("session-owner")
-    wait_task = manager.wait_for_completion("session-owner", timeout=2.0)
+    session = await runtime.create_session("session-owner")
+    wait_task = runtime.wait_for_completion("session-owner", timeout=2.0)
 
     async with httpx.AsyncClient(timeout=5.0) as client:
         response = await client.post(
@@ -50,19 +49,20 @@ async def test_async_llm_server_manager_owns_gateway_lifecycle_and_session_runti
         assert complete.status_code == 200
 
     await wait_task
-    trajectories = await manager.finalize_session("session-owner")
-    await manager.shutdown()
+    trajectories = await runtime.finalize_session("session-owner")
+    await runtime.shutdown()
 
     assert len(trajectories) == 1
     assert trajectories[0].reward_info == {"score": 0.5, "label": "owner"}
+
+
 @pytest.mark.asyncio
-async def test_async_llm_server_manager_injects_manager_owned_gateway_backend(ray_runtime):
-    from verl.experimental.agent_loop.agent_loop import AsyncLLMServerManager
+async def test_gateway_serving_runtime_injects_runtime_owned_gateway_backend(ray_runtime):
+    from verl.agent.gateway.runtime import GatewayServingRuntime
 
     rollout_server = RecordingRolloutServer.remote("MANAGED")
     load_balancer = RecordingLoadBalancer.remote("server-0")
-    manager = AsyncLLMServerManager(
-        config=None,
+    runtime = GatewayServingRuntime(
         servers=[("server-0", rollout_server)],
         load_balancer_handle=load_balancer,
         gateway_count=1,
@@ -72,7 +72,7 @@ async def test_async_llm_server_manager_injects_manager_owned_gateway_backend(ra
         },
     )
 
-    session = await manager.create_session("session-managed-backend")
+    session = await runtime.create_session("session-managed-backend")
     async with httpx.AsyncClient(timeout=5.0) as client:
         response = await client.post(
             f"{session.base_url}/chat/completions",
@@ -81,8 +81,8 @@ async def test_async_llm_server_manager_injects_manager_owned_gateway_backend(ra
         assert response.status_code == 200
         assert response.json()["choices"][0]["message"]["content"] == "MANAGED"
 
-    trajectories = await manager.finalize_session("session-managed-backend")
-    await manager.shutdown()
+    trajectories = await runtime.finalize_session("session-managed-backend")
+    await runtime.shutdown()
 
     stats = ray.get(load_balancer.stats.remote())
     calls = ray.get(rollout_server.get_calls.remote())

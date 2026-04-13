@@ -1,8 +1,10 @@
 import numpy as np
 import torch
+from tensordict import TensorDict
 
-from verl.experimental.agent_framework.assembler import TrajectoryAssembler
-from verl.experimental.agent_framework.types import Trajectory
+from verl.agent.framework.assembler import TrajectoryAssembler
+from verl.agent.framework.types import Trajectory
+from verl.utils import tensordict_utils as tu
 
 
 def test_trajectory_assembler_matches_training_batch_contract():
@@ -53,18 +55,19 @@ def test_trajectory_assembler_matches_training_batch_contract():
 
     output = TrajectoryAssembler(pad_token_id=0).assemble(trajectories)
 
-    assert tuple(output.batch["prompts"].shape) == (2, 2)
-    assert tuple(output.batch["responses"].shape) == (2, 3)
-    assert tuple(output.batch["response_mask"].shape) == (2, 3)
-    assert tuple(output.batch["input_ids"].shape) == (2, 5)
-    assert tuple(output.batch["attention_mask"].shape) == (2, 5)
-    assert tuple(output.batch["position_ids"].shape) == (2, 5)
-    assert tuple(output.batch["rollout_log_probs"].shape) == (2, 3)
-    assert tuple(output.batch["routed_experts"].shape) == (2, 5, 2, 1)
-    assert tuple(output.batch["rm_scores"].shape) == (2, 3)
+    assert isinstance(output, TensorDict)
+    assert tuple(output["prompts"].shape) == (2, 2)
+    assert tuple(output["responses"].shape) == (2, 3)
+    assert tuple(output["response_mask"].shape) == (2, 3)
+    assert tuple(output["input_ids"].shape) == (2, 5)
+    assert tuple(output["attention_mask"].shape) == (2, 5)
+    assert tuple(output["position_ids"].shape) == (2, 5)
+    assert tuple(output["rollout_log_probs"].shape) == (2, 3)
+    assert tuple(output["routed_experts"].shape) == (2, 5, 2, 1)
+    assert tuple(output["rm_scores"].shape) == (2, 3)
 
     torch.testing.assert_close(
-        output.batch["prompts"],
+        output["prompts"],
         torch.tensor(
             [
                 [10, 11],
@@ -74,7 +77,7 @@ def test_trajectory_assembler_matches_training_batch_contract():
         ),
     )
     torch.testing.assert_close(
-        output.batch["responses"],
+        output["responses"],
         torch.tensor(
             [
                 [20, 21, 22],
@@ -84,7 +87,7 @@ def test_trajectory_assembler_matches_training_batch_contract():
         ),
     )
     torch.testing.assert_close(
-        output.batch["response_mask"],
+        output["response_mask"],
         torch.tensor(
             [
                 [1, 1, 0],
@@ -94,7 +97,7 @@ def test_trajectory_assembler_matches_training_batch_contract():
         ),
     )
     torch.testing.assert_close(
-        output.batch["attention_mask"],
+        output["attention_mask"],
         torch.tensor(
             [
                 [1, 1, 1, 1, 1],
@@ -104,7 +107,7 @@ def test_trajectory_assembler_matches_training_batch_contract():
         ),
     )
     torch.testing.assert_close(
-        output.batch["position_ids"],
+        output["position_ids"],
         torch.tensor(
             [
                 [0, 1, 2, 3, 4],
@@ -114,7 +117,7 @@ def test_trajectory_assembler_matches_training_batch_contract():
         ),
     )
     torch.testing.assert_close(
-        output.batch["rm_scores"],
+        output["rm_scores"],
         torch.tensor(
             [
                 [0.0, 0.0, 0.5],
@@ -124,7 +127,7 @@ def test_trajectory_assembler_matches_training_batch_contract():
         ),
     )
     torch.testing.assert_close(
-        output.batch["rollout_log_probs"],
+        output["rollout_log_probs"],
         torch.tensor(
             [
                 [-0.1, -0.2, 0.0],
@@ -134,7 +137,7 @@ def test_trajectory_assembler_matches_training_batch_contract():
         ),
     )
 
-    second_experts = output.batch["routed_experts"][1]
+    second_experts = output["routed_experts"][1]
     expected_second_experts = torch.zeros((5, 2, 1), dtype=torch.int64)
     expected_second_experts[1:4] = torch.tensor(
         [
@@ -146,6 +149,6 @@ def test_trajectory_assembler_matches_training_batch_contract():
     )
     torch.testing.assert_close(second_experts, expected_second_experts)
 
-    assert np.array_equal(output.non_tensor_batch["__num_turns__"], np.array([2, 3], dtype=np.int32))
-    assert np.array_equal(output.non_tensor_batch["label"], np.array(["alpha", "beta"], dtype=object))
-    assert output.meta_info["reward_extra_keys"] == ["score", "label"]
+    assert np.array_equal(np.array(tu.get(output, "__num_turns__"), dtype=np.int32), np.array([2, 3], dtype=np.int32))
+    assert np.array_equal(np.array(tu.get(output, "label"), dtype=object), np.array(["alpha", "beta"], dtype=object))
+    assert tu.get(output, "reward_extra_keys") == ["score", "label"]

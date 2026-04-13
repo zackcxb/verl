@@ -2,7 +2,7 @@ import httpx
 import pytest
 import ray
 
-from tests.experimental.agent_gateway.support import FakeTokenizer, QueuedBackend, TrackingGatewayActor
+from tests.agent.support import FakeTokenizer, QueuedBackend, TrackingGatewayActor
 
 
 @pytest.fixture
@@ -14,8 +14,8 @@ def ray_runtime():
 
 @pytest.mark.asyncio
 async def test_gateway_manager_routes_sessions_stickily(ray_runtime):
-    from verl.experimental.agent_gateway.gateway import GatewayActor
-    from verl.experimental.agent_gateway.manager import GatewayManager
+    from verl.agent.gateway.gateway import GatewayActor
+    from verl.agent.gateway.manager import GatewayManager
 
     gateways = [
         GatewayActor.remote(tokenizer=FakeTokenizer(), backend=QueuedBackend(["A"]), host="127.0.0.1"),
@@ -53,7 +53,7 @@ async def test_gateway_manager_routes_sessions_stickily(ray_runtime):
 
 @pytest.mark.asyncio
 async def test_gateway_manager_uses_least_active_sessions_routing(ray_runtime):
-    from verl.experimental.agent_gateway.manager import GatewayManager
+    from verl.agent.gateway.manager import GatewayManager
 
     gateways = [
         TrackingGatewayActor.remote("gw-0"),

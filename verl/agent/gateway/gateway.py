@@ -10,8 +10,8 @@ import ray
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from verl.experimental.agent_framework.types import SessionHandle, Trajectory
-from verl.experimental.agent_gateway.types import GatewaySessionState, SessionPhase, TrajectoryBuffer
+from verl.agent.framework.types import SessionHandle, Trajectory
+from verl.agent.gateway.types import GatewaySessionState, SessionPhase, TrajectoryBuffer
 from verl.experimental.agent_loop.tool_parser import ToolParser
 from verl.utils.chat_template import apply_chat_template as _apply_chat_template, initialize_system_prompt
 from verl.utils.tokenizer import normalize_token_ids
