@@ -96,6 +96,7 @@ def _normalize_request_context(payload: dict[str, Any]) -> dict[str, Any]:
 def _is_message_prefix(prefix: list[dict[str, Any]], messages: list[dict[str, Any]]) -> bool:
     if len(prefix) > len(messages):
         return False
+    # TODO：shall we canonicalize tool arguments here in case agent re-dump tool arguments?
     return prefix == messages[: len(prefix)]
 
 
