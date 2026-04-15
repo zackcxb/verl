@@ -1,4 +1,6 @@
 import asyncio
+import copy
+import json
 
 import httpx
 import pytest
@@ -9,6 +11,7 @@ from tests.agent.support import (
     FakeTokenizer,
     QueuedBackend,
     RejectConcurrentSessionBackend,
+    RejectRequestEnvelopeBackend,
     RejectToolsSamplingParamsBackend,
     SequencedBackend,
 )
@@ -59,38 +62,6 @@ def test_normalize_request_context_preserves_structured_fields():
     assert context["messages"][0]["content"][1]["type"] == "image_url"
     assert context["messages"][1]["tool_calls"][0]["id"] == "call-1"
     assert context["messages"][2]["tool_call_id"] == "call-1"
-def test_normalize_request_context_preserves_tool_argument_strings():
-    """Validate that tool_calls arguments are preserved as-is (no canonicalization).
-
-    This is intentional: prefix comparison uses direct equality, so any
-    format drift (e.g. JSON key reorder by the agent) is treated as a
-    context change.
-    """
-    from verl.agent.gateway.gateway import _normalize_request_context
-
-    context = _normalize_request_context(
-        {
-            "messages": [
-                {
-                    "role": "assistant",
-                    "content": "",
-                    "tool_calls": [
-                        {
-                            "id": "call-1",
-                            "type": "function",
-                            "function": {
-                                "name": "search",
-                                "arguments": '{"b": 2, "a": 1}',
-                            },
-                        }
-                    ],
-                }
-            ]
-        }
-    )
-
-    # Arguments preserved as original JSON string, not parsed/canonicalized
-    assert context["messages"][0]["tool_calls"][0]["function"]["arguments"] == '{"b": 2, "a": 1}'
 
 
 @pytest.mark.asyncio
@@ -235,6 +206,34 @@ async def test_gateway_actor_does_not_forward_tools_in_sampling_params(ray_runti
 
 
 @pytest.mark.asyncio
+async def test_gateway_actor_strips_request_envelope_but_keeps_sampling_params(ray_runtime):
+    from verl.agent.gateway.gateway import GatewayActor
+
+    actor = GatewayActor.remote(
+        tokenizer=FakeTokenizer(),
+        backend=RejectRequestEnvelopeBackend("SAFE"),
+        host="127.0.0.1",
+    )
+    ray.get(actor.start.remote())
+    session = ray.get(actor.create_session.remote("session-envelope-boundary"))
+
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        response = await client.post(
+            f"{session.base_url}/chat/completions",
+            json={
+                "model": "dummy-model",
+                "temperature": 0.25,
+                "tools": [{"type": "function", "function": {"name": "search", "parameters": {"type": "object"}}}],
+                "messages": [{"role": "user", "content": "first turn"}],
+            },
+        )
+
+    ray.get(actor.shutdown.remote())
+
+    assert response.status_code == 200
+
+
+@pytest.mark.asyncio
 async def test_gateway_actor_continuation_preserves_prompt_and_generation_masks(ray_runtime):
     from verl.agent.gateway.gateway import GatewayActor
 
@@ -276,6 +275,76 @@ async def test_gateway_actor_continuation_preserves_prompt_and_generation_masks(
     assert len(trajectories) == 1
     assert 0 in trajectories[0].response_mask
     assert trajectories[0].response_mask[-len("SECOND") :] == [1] * len("SECOND")
+
+
+@pytest.mark.asyncio
+async def test_gateway_actor_tool_argument_format_drift_splits_after_valid_continuation(ray_runtime):
+    from verl.agent.gateway.gateway import GatewayActor
+
+    tool_call_text = '<tool_call>\n{"name": "search", "arguments": {"b": 2, "a": 1}}\n</tool_call>'
+    actor = GatewayActor.remote(
+        tokenizer=FakeTokenizer(),
+        backend=QueuedBackend([tool_call_text, "SECOND", "THIRD"]),
+        host="127.0.0.1",
+        tool_parser_name="hermes",
+    )
+    ray.get(actor.start.remote())
+    session = ray.get(actor.create_session.remote("session-tool-arg-drift"))
+
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        first = await client.post(
+            f"{session.base_url}/chat/completions",
+            json={
+                "model": "dummy-model",
+                "tools": [{"type": "function", "function": {"name": "search", "parameters": {"type": "object"}}}],
+                "messages": [{"role": "user", "content": "what is the weather?"}],
+            },
+        )
+        assert first.status_code == 200
+        assistant_tool_message = first.json()["choices"][0]["message"]
+
+        second = await client.post(
+            f"{session.base_url}/chat/completions",
+            json={
+                "model": "dummy-model",
+                "tools": [{"type": "function", "function": {"name": "search", "parameters": {"type": "object"}}}],
+                "messages": [
+                    {"role": "user", "content": "what is the weather?"},
+                    assistant_tool_message,
+                    {"role": "tool", "tool_call_id": assistant_tool_message["tool_calls"][0]["id"], "content": "sunny"},
+                ],
+            },
+        )
+        assert second.status_code == 200
+
+        drifted_tool_message = copy.deepcopy(assistant_tool_message)
+        drifted_tool_message["tool_calls"][0]["function"]["arguments"] = json.dumps({"a": 1, "b": 2})
+        third = await client.post(
+            f"{session.base_url}/chat/completions",
+            json={
+                "model": "dummy-model",
+                "tools": [{"type": "function", "function": {"name": "search", "parameters": {"type": "object"}}}],
+                "messages": [
+                    {"role": "user", "content": "what is the weather?"},
+                    drifted_tool_message,
+                    {"role": "tool", "tool_call_id": assistant_tool_message["tool_calls"][0]["id"], "content": "sunny"},
+                    {"role": "assistant", "content": "SECOND"},
+                    {"role": "user", "content": "follow up"},
+                ],
+            },
+        )
+        assert third.status_code == 200
+
+    trajectories = ray.get(actor.finalize_session.remote("session-tool-arg-drift"))
+    ray.get(actor.shutdown.remote())
+
+    assert len(trajectories) == 2
+    assert trajectories[0].trajectory_id == 0
+    assert trajectories[1].trajectory_id == 1
+    assert 0 in trajectories[0].response_mask
+    assert trajectories[1].response_mask == [1] * len("THIRD")
+
+
 @pytest.mark.asyncio
 async def test_gateway_actor_serializes_same_session_concurrent_requests(ray_runtime):
     from verl.agent.gateway.gateway import GatewayActor
@@ -310,6 +379,8 @@ async def test_gateway_actor_serializes_same_session_concurrent_requests(ray_run
     assert trajectories[1].response_ids == [ord(char) for char in "SECOND"]
     assert trajectories[0].response_mask == [1] * len("FIRST")
     assert trajectories[1].response_mask == [1] * len("SECOND")
+
+
 @pytest.mark.asyncio
 async def test_gateway_actor_rejects_chat_after_complete(ray_runtime):
     from verl.agent.gateway.gateway import GatewayActor
@@ -331,7 +402,59 @@ async def test_gateway_actor_rejects_chat_after_complete(ray_runtime):
 
 
 @pytest.mark.asyncio
-async def test_gateway_actor_rejects_invalid_requests_with_bad_request(ray_runtime):
+async def test_gateway_actor_finalizes_without_complete(ray_runtime):
+    from verl.agent.gateway.gateway import GatewayActor
+
+    actor = GatewayActor.remote(tokenizer=FakeTokenizer(), backend=QueuedBackend(["DONE"]), host="127.0.0.1")
+    ray.get(actor.start.remote())
+    session = ray.get(actor.create_session.remote("session-finalize-without-complete"))
+
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        response = await client.post(
+            f"{session.base_url}/chat/completions",
+            json={"model": "dummy-model", "messages": [{"role": "user", "content": "finish directly"}]},
+        )
+        assert response.status_code == 200
+
+    trajectories = ray.get(actor.finalize_session.remote("session-finalize-without-complete"))
+    ray.get(actor.shutdown.remote())
+
+    assert len(trajectories) == 1
+    assert trajectories[0].trajectory_id == 0
+    assert trajectories[0].reward_info == {}
+
+
+@pytest.mark.parametrize(
+    ("payload", "detail_fragment"),
+    [
+        ({"model": "dummy-model", "messages": []}, "messages must be non-empty"),
+        (
+            {"model": "dummy-model", "messages": [{"role": "user", "name": "alice", "content": "hello"}]},
+            "message.name is not supported",
+        ),
+        (
+            {"model": "dummy-model", "messages": [{"role": "user", "content": 123}]},
+            "Unsupported content type",
+        ),
+        (
+            {
+                "model": "dummy-model",
+                "messages": [{"role": "assistant", "content": "", "tool_calls": {"id": "call-1"}}],
+            },
+            "tool_calls must be a list",
+        ),
+        (
+            {
+                "model": "dummy-model",
+                "tools": {"type": "function"},
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+            "tools must be a list",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_gateway_actor_rejects_malformed_requests_with_bad_request(ray_runtime, payload, detail_fragment):
     from verl.agent.gateway.gateway import GatewayActor
 
     actor = GatewayActor.remote(tokenizer=FakeTokenizer(), backend=QueuedBackend(["DONE"]), host="127.0.0.1")
@@ -339,19 +462,15 @@ async def test_gateway_actor_rejects_invalid_requests_with_bad_request(ray_runti
     session = ray.get(actor.create_session.remote("session-validation"))
 
     async with httpx.AsyncClient(timeout=5.0) as client:
-        malformed = await client.post(
+        response = await client.post(
             f"{session.base_url}/chat/completions",
-            json={"model": "dummy-model", "messages": []},
-        )
-        unsupported = await client.post(
-            f"{session.base_url}/chat/completions",
-            json={"model": "dummy-model", "messages": [{"role": "user", "name": "alice", "content": "hello"}]},
+            json=payload,
         )
 
     ray.get(actor.shutdown.remote())
 
-    assert malformed.status_code == 400
-    assert unsupported.status_code == 400
+    assert response.status_code == 400
+    assert detail_fragment in response.text
 
 
 @pytest.mark.asyncio

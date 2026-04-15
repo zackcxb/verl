@@ -79,3 +79,28 @@ async def test_gateway_manager_uses_least_active_sessions_routing(ray_runtime):
     assert manager.active_sessions_per_gateway == [2, 1]
 
     ray.get([gateway.shutdown.remote() for gateway in gateways])
+
+
+@pytest.mark.asyncio
+async def test_gateway_manager_wait_for_completion_delegates_to_session_owner(ray_runtime):
+    from verl.agent.gateway.manager import GatewayManager
+
+    gateways = [
+        TrackingGatewayActor.remote("gw-0"),
+        TrackingGatewayActor.remote("gw-1"),
+    ]
+    ray.get([gateway.start.remote() for gateway in gateways])
+
+    manager = GatewayManager(gateways)
+    await manager.create_session("session-a")
+    await manager.create_session("session-b")
+
+    await manager.wait_for_completion("session-a", timeout=1.5)
+
+    stats_0 = ray.get(gateways[0].stats.remote())
+    stats_1 = ray.get(gateways[1].stats.remote())
+
+    assert stats_0["waited"] == [("session-a", 1.5)]
+    assert stats_1["waited"] == []
+
+    ray.get([gateway.shutdown.remote() for gateway in gateways])

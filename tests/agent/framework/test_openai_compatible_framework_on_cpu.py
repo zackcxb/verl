@@ -128,7 +128,55 @@ async def test_openai_compatible_framework_runs_against_fake_session_runtime():
 
 
 @pytest.mark.asyncio
-async def test_openai_compatible_framework_waits_and_broadcasts_sample_fields():
+async def test_openai_compatible_framework_waits_for_completion_when_configured():
+    from verl.agent.framework.framework import OpenAICompatibleAgentFramework
+    from verl.agent.framework.types import SessionRewardContext
+
+    prompts = _build_prompts(
+        raw_prompt=[[{"role": "user", "content": "Wait for completion"}]],
+    )
+    session_id = "session-1-fixed"
+    runtime = _FakeSessionRuntime(
+        {
+            session_id: [
+                _build_trajectory(
+                    uid="sample-uid",
+                    session_id=session_id,
+                    trajectory_id=0,
+                    prompt_ids=[1],
+                    response_ids=[2],
+                    response_mask=[1],
+                ),
+            ]
+        }
+    )
+
+    async def agent_runner(*, raw_prompt, session, sample_index):
+        assert raw_prompt == [{"role": "user", "content": "Wait for completion"}]
+        assert sample_index == 0
+        assert session.session_id == session_id
+
+    def reward_fn(ctx: SessionRewardContext) -> list[float]:
+        return [1.0]
+
+    framework = OpenAICompatibleAgentFramework(
+        session_runtime=runtime,
+        agent_runner=agent_runner,
+        reward_fn=reward_fn,
+        wait_for_completion_after_agent_run=True,
+        completion_timeout=12.5,
+    )
+    framework._build_session_id = lambda prompts, sample_index: session_id
+
+    output = await framework.generate_sequences(prompts)
+
+    assert runtime.waited_sessions == [(session_id, 12.5)]
+    assert runtime.finalized_sessions == [session_id]
+    assert len(output) == 1
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_framework_broadcasts_sample_fields_to_multiple_trajectories():
     from verl.agent.framework.framework import OpenAICompatibleAgentFramework
     from verl.agent.framework.types import SessionRewardContext
 
@@ -137,7 +185,7 @@ async def test_openai_compatible_framework_waits_and_broadcasts_sample_fields():
         uid=["sample-uid"],
         extra_info=[{"split": "train"}],
     )
-    session_id = "session-1-fixed"
+    session_id = "session-1b-fixed"
     runtime = _FakeSessionRuntime(
         {
             session_id: [
@@ -176,14 +224,12 @@ async def test_openai_compatible_framework_waits_and_broadcasts_sample_fields():
         session_runtime=runtime,
         agent_runner=agent_runner,
         reward_fn=reward_fn,
-        wait_for_completion_after_agent_run=True,
-        completion_timeout=12.5,
     )
     framework._build_session_id = lambda prompts, sample_index: session_id
 
     output = await framework.generate_sequences(prompts)
 
-    assert runtime.waited_sessions == [(session_id, 12.5)]
+    assert runtime.waited_sessions == []
     assert tu.get(output, "uid") == ["sample-uid", "sample-uid"]
     assert tu.get(output, "extra_info") == [{"split": "train"}, {"split": "train"}]
     assert tu.get(output, "label") == ["first", "second"]

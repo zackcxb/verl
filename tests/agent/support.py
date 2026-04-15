@@ -74,6 +74,23 @@ class RejectToolsSamplingParamsBackend:
         )
 
 
+class RejectRequestEnvelopeBackend:
+    def __init__(self, response_text: str = "OK"):
+        self.response_text = response_text
+
+    async def generate(self, request_id, *, prompt_ids, sampling_params):
+        assert "messages" not in sampling_params
+        assert "model" not in sampling_params
+        assert "tools" not in sampling_params
+        assert sampling_params["temperature"] == 0.25
+        token_ids = [ord(char) for char in self.response_text]
+        return TokenOutput(
+            token_ids=token_ids,
+            log_probs=[-0.1] * len(token_ids),
+            stop_reason="completed",
+        )
+
+
 class FailingBackend:
     def __init__(self, error_message: str = "backend failure"):
         self.error_message = error_message
@@ -168,6 +185,34 @@ class RecordingRolloutServer:
         return list(self.calls)
 
 
+@ray.remote
+class FailingRolloutServer:
+    def __init__(self, error_message: str = "rollout failure"):
+        self.error_message = error_message
+        self.calls = []
+
+    async def generate(
+        self,
+        request_id,
+        *,
+        prompt_ids,
+        sampling_params,
+        image_data=None,
+        video_data=None,
+    ):
+        self.calls.append(
+            {
+                "request_id": request_id,
+                "prompt_ids": list(prompt_ids),
+                "sampling_params": dict(sampling_params),
+            }
+        )
+        raise RuntimeError(self.error_message)
+
+    def get_calls(self):
+        return list(self.calls)
+
+
 class RejectConcurrentSessionBackend:
     def __init__(self, responses, delay: float = 0.05):
         self._responses = list(responses)
@@ -204,6 +249,7 @@ class TrackingGatewayActor:
         self.created = []
         self.finalized = []
         self.aborted = []
+        self.waited = []
 
     async def start(self):
         return None
@@ -237,6 +283,7 @@ class TrackingGatewayActor:
         return None
 
     async def wait_for_completion(self, session_id: str, timeout: float | None = None):
+        self.waited.append((session_id, timeout))
         return None
 
     async def stats(self):
@@ -245,4 +292,5 @@ class TrackingGatewayActor:
             "created": list(self.created),
             "finalized": list(self.finalized),
             "aborted": list(self.aborted),
+            "waited": list(self.waited),
         }
