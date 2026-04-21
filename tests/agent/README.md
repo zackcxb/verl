@@ -34,7 +34,11 @@ the default GPU unit-test workflow.
   - `test_openai_compatible_framework_broadcasts_sample_fields_to_multiple_trajectories`
     - Verifies a single sample's non-tensor fields are broadcast to all trajectories materialized from that sample.
   - `test_openai_compatible_framework_aborts_session_on_agent_error`
-    - Verifies agent runner failures trigger `abort_session()` and do not finalize the session.
+    - Verifies agent runner failures trigger `abort_session()`, do not finalize the session, and surface a clear all-failed batch error when no sample succeeds.
+  - `test_openai_compatible_framework_drops_failed_samples_but_keeps_successful_ones`
+    - Verifies a mixed batch can drop a failed sample while still finalizing, rewarding, and assembling the successful sample.
+  - `test_openai_compatible_framework_raises_when_all_samples_fail_without_calling_assembler`
+    - Verifies an all-failed batch raises a clear error and does not call the assembler with an empty trajectory list.
   - `test_openai_compatible_framework_omits_rollout_log_probs_when_missing`
     - Verifies missing rollout logprobs stay absent from the assembled batch instead of being synthesized.
 
@@ -52,11 +56,15 @@ the default GPU unit-test workflow.
   - `test_gateway_actor_does_not_forward_tools_in_sampling_params`
     - Verifies `tools` are stripped before backend generation params are forwarded.
   - `test_gateway_actor_strips_request_envelope_but_keeps_sampling_params`
-    - Verifies request-envelope fields such as `messages`, `model`, and `tools` are removed at the backend boundary while real sampling params still pass through.
+    - Verifies request-envelope fields such as `messages`, `model`, and `tools` are removed at the backend boundary while backend sampling params come from gateway-owned base params plus whitelisted request overrides.
+  - `test_gateway_actor_ignores_non_whitelisted_request_sampling_params`
+    - Verifies non-whitelisted request fields do not leak into backend sampling params.
   - `test_gateway_actor_continuation_preserves_prompt_and_generation_masks`
     - Verifies continuation tokenization appends mask `0` for replayed/incremental context and mask `1` for newly generated tokens.
-  - `test_gateway_actor_tool_argument_format_drift_splits_after_valid_continuation`
-    - Verifies after one valid continuation, tool-call argument string drift is treated as a context split at the actor behavior level.
+  - `test_gateway_actor_tool_argument_json_equivalence_does_not_split_after_valid_continuation`
+    - Verifies JSON-equivalent tool-call arguments do not trigger a trajectory split when only key order changes.
+  - `test_message_prefix_falls_back_to_raw_tool_argument_value_comparison_when_arguments_are_invalid_json`
+    - Verifies invalid tool-call argument strings fall back to raw-value comparison rather than best-effort JSON equivalence.
   - `test_gateway_actor_serializes_same_session_concurrent_requests`
     - Verifies concurrent requests targeting the same session are serialized rather than entering the backend concurrently.
   - `test_gateway_actor_rejects_chat_after_complete`
@@ -82,7 +90,7 @@ the default GPU unit-test workflow.
   - `test_gateway_serving_runtime_owns_gateway_lifecycle_and_session_runtime`
     - Verifies the runtime can own gateway actor lifecycle plus session creation, wait, completion, and finalization behavior.
   - `test_gateway_serving_runtime_injects_runtime_owned_gateway_backend`
-    - Verifies runtime-owned gateways use the runtime itself as backend and correctly integrate with the mocked load balancer and rollout server.
+    - Verifies runtime-owned gateways use the runtime itself as backend and correctly apply gateway-owned base sampling params plus whitelisted request overrides before calling the rollout server.
   - `test_gateway_serving_runtime_releases_server_when_generate_fails`
     - Verifies backend-server slots are still released when `generate()` raises, preventing load-balancer bookkeeping leaks.
   - `test_gateway_serving_runtime_gateway_count_zero_falls_back_to_generate_only_mode`

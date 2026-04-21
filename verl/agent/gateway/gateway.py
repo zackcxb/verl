@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from dataclasses import replace
 from typing import Any
@@ -20,6 +21,14 @@ from verl.workers.rollout.utils import run_uvicorn
 
 class MalformedRequestError(ValueError):
     pass
+
+
+_DEFAULT_ALLOWED_REQUEST_SAMPLING_PARAM_KEYS = frozenset({
+    "temperature",
+    "top_p",
+    "top_k",
+    "max_tokens",
+})
 
 
 # TODO: double-check if all these validations/normalization are necessary
@@ -93,11 +102,59 @@ def _normalize_request_context(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _build_sampling_params(
+    payload: dict[str, Any],
+    *,
+    base_sampling_params: dict[str, Any],
+    allowed_request_sampling_param_keys: frozenset[str],
+) -> dict[str, Any]:
+    sampling_params = dict(base_sampling_params)
+    for key in allowed_request_sampling_param_keys:
+        if key in payload:
+            sampling_params[key] = payload[key]
+    return sampling_params
+
+
+def _canonicalize_tool_arguments_for_comparison(arguments: Any) -> tuple[str, Any]:
+    if isinstance(arguments, dict | list):
+        return ("json", arguments)
+    if isinstance(arguments, str):
+        try:
+            return ("json", json.loads(arguments))
+        except json.JSONDecodeError:
+            return ("raw", arguments)
+    return ("raw", arguments)
+
+
+def _canonicalize_message_for_prefix_comparison(message: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(message)
+    tool_calls = normalized.get("tool_calls")
+    if not isinstance(tool_calls, list):
+        return normalized
+
+    normalized_tool_calls: list[dict[str, Any]] = []
+    for tool_call in tool_calls:
+        normalized_tool_call = dict(tool_call)
+        function = normalized_tool_call.get("function")
+        if isinstance(function, dict) and "arguments" in function:
+            normalized_function = dict(function)
+            normalized_function["arguments"] = _canonicalize_tool_arguments_for_comparison(function["arguments"])
+            normalized_tool_call["function"] = normalized_function
+        normalized_tool_calls.append(normalized_tool_call)
+    normalized["tool_calls"] = normalized_tool_calls
+    return normalized
+
+
 def _is_message_prefix(prefix: list[dict[str, Any]], messages: list[dict[str, Any]]) -> bool:
     if len(prefix) > len(messages):
         return False
-    # TODO：shall we canonicalize tool arguments here in case agent re-dump tool arguments?
-    return prefix == messages[: len(prefix)]
+    return [
+        _canonicalize_message_for_prefix_comparison(message)
+        for message in prefix
+    ] == [
+        _canonicalize_message_for_prefix_comparison(message)
+        for message in messages[: len(prefix)]
+    ]
 
 
 def _is_request_context_prefix(
@@ -152,6 +209,8 @@ class _GatewayActor:
         *,
         tool_parser_name: str | None = None,
         apply_chat_template_kwargs: dict[str, Any] | None = None,
+        base_sampling_params: dict[str, Any] | None = None,
+        allowed_request_sampling_param_keys: set[str] | frozenset[str] | None = None,
     ):
         # Same pattern as vllm_async_server.py / async_sglang_server.py:
         # use the node's routable IP for both bind and URL by default.
@@ -159,6 +218,13 @@ class _GatewayActor:
         self._tokenizer = tokenizer
         self._backend = backend
         self._apply_chat_template_kwargs = apply_chat_template_kwargs or {}
+        self._base_sampling_params = dict(base_sampling_params or {})
+        allowed_keys = (
+            _DEFAULT_ALLOWED_REQUEST_SAMPLING_PARAM_KEYS
+            if allowed_request_sampling_param_keys is None
+            else frozenset(allowed_request_sampling_param_keys)
+        )
+        self._allowed_request_sampling_param_keys = allowed_keys
         self._system_prompt = initialize_system_prompt(tokenizer, **self._apply_chat_template_kwargs)
         self._tool_parser = (
             ToolParser.get_tool_parser(tool_parser_name, tokenizer) if tool_parser_name else None
@@ -342,11 +408,11 @@ class _GatewayActor:
 
             # TODO: prompt_ids for generate requests are different from those in trajectories, shall we use different variable names?
             generation_context_ids = active_trajectory.prompt_ids + active_trajectory.response_ids
-            sampling_params = dict(payload)
-            # TODO: check if there are other fields that need to be popped
-            sampling_params.pop("messages", None)
-            sampling_params.pop("model", None)
-            sampling_params.pop("tools", None)
+            sampling_params = _build_sampling_params(
+                payload,
+                base_sampling_params=self._base_sampling_params,
+                allowed_request_sampling_param_keys=self._allowed_request_sampling_param_keys,
+            )
             output = await self._backend.generate(
                 request_id=session_id,
                 prompt_ids=generation_context_ids,

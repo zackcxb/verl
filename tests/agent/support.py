@@ -75,14 +75,18 @@ class RejectToolsSamplingParamsBackend:
 
 
 class RejectRequestEnvelopeBackend:
-    def __init__(self, response_text: str = "OK"):
+    def __init__(self, response_text: str = "OK", expected_sampling_params: dict | None = None):
         self.response_text = response_text
+        self.expected_sampling_params = expected_sampling_params
 
     async def generate(self, request_id, *, prompt_ids, sampling_params):
         assert "messages" not in sampling_params
         assert "model" not in sampling_params
         assert "tools" not in sampling_params
-        assert sampling_params["temperature"] == 0.25
+        if self.expected_sampling_params is None:
+            assert sampling_params["temperature"] == 0.25
+        else:
+            assert sampling_params == self.expected_sampling_params
         token_ids = [ord(char) for char in self.response_text]
         return TokenOutput(
             token_ids=token_ids,

@@ -69,16 +69,29 @@ class OpenAICompatibleAgentFramework(AgentFramework):
             self._run_session(prompts=prompts, raw_prompt=raw_prompts[i], sample_index=i)
             for i in range(len(prompts))
         ]
-        nested = await asyncio.gather(*tasks)
+        nested = await asyncio.gather(*tasks, return_exceptions=True)
         all_trajectories: list[Trajectory] = []
         expanded_non_tensor_batch: dict[str, list[object]] = {}
+        successful_sessions = 0
+        failures: list[Exception] = []
 
-        for session_trajectories, sample_fields in nested:
+        for outcome in nested:
+            if isinstance(outcome, Exception):
+                failures.append(outcome)
+                continue
+
+            successful_sessions += 1
+            session_trajectories, sample_fields = outcome
             all_trajectories.extend(session_trajectories)
             if not session_trajectories:
                 continue
             for key, values in _broadcast_sample_non_tensor_fields(sample_fields, len(session_trajectories)).items():
                 expanded_non_tensor_batch.setdefault(key, []).extend(values)
+
+        if not all_trajectories:
+            if successful_sessions == 0:
+                raise RuntimeError("All sessions failed; no trajectories were produced") from failures[0]
+            raise ValueError("Successful sessions produced no trajectories")
 
         assembled = self.assembler.assemble(all_trajectories)
         result = assembled.copy()

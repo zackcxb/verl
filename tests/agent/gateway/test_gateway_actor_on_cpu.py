@@ -211,8 +211,13 @@ async def test_gateway_actor_strips_request_envelope_but_keeps_sampling_params(r
 
     actor = GatewayActor.remote(
         tokenizer=FakeTokenizer(),
-        backend=RejectRequestEnvelopeBackend("SAFE"),
+        backend=RejectRequestEnvelopeBackend(
+            "SAFE",
+            expected_sampling_params={"temperature": 0.25, "top_p": 0.8, "max_tokens": 128},
+        ),
         host="127.0.0.1",
+        base_sampling_params={"temperature": 0.1, "top_p": 0.8, "max_tokens": 64},
+        allowed_request_sampling_param_keys={"temperature", "max_tokens"},
     )
     ray.get(actor.start.remote())
     session = ray.get(actor.create_session.remote("session-envelope-boundary"))
@@ -223,7 +228,41 @@ async def test_gateway_actor_strips_request_envelope_but_keeps_sampling_params(r
             json={
                 "model": "dummy-model",
                 "temperature": 0.25,
+                "max_tokens": 128,
+                "presence_penalty": 1.5,
                 "tools": [{"type": "function", "function": {"name": "search", "parameters": {"type": "object"}}}],
+                "messages": [{"role": "user", "content": "first turn"}],
+            },
+        )
+
+    ray.get(actor.shutdown.remote())
+
+    assert response.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_gateway_actor_ignores_non_whitelisted_request_sampling_params(ray_runtime):
+    from verl.agent.gateway.gateway import GatewayActor
+
+    actor = GatewayActor.remote(
+        tokenizer=FakeTokenizer(),
+        backend=RejectRequestEnvelopeBackend(
+            "SAFE",
+            expected_sampling_params={"temperature": 0.1, "top_p": 0.9},
+        ),
+        host="127.0.0.1",
+        base_sampling_params={"temperature": 0.1, "top_p": 0.9},
+        allowed_request_sampling_param_keys={"temperature"},
+    )
+    ray.get(actor.start.remote())
+    session = ray.get(actor.create_session.remote("session-non-whitelist"))
+
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        response = await client.post(
+            f"{session.base_url}/chat/completions",
+            json={
+                "model": "dummy-model",
+                "presence_penalty": 1.5,
                 "messages": [{"role": "user", "content": "first turn"}],
             },
         )
@@ -278,7 +317,7 @@ async def test_gateway_actor_continuation_preserves_prompt_and_generation_masks(
 
 
 @pytest.mark.asyncio
-async def test_gateway_actor_tool_argument_format_drift_splits_after_valid_continuation(ray_runtime):
+async def test_gateway_actor_tool_argument_json_equivalence_does_not_split_after_valid_continuation(ray_runtime):
     from verl.agent.gateway.gateway import GatewayActor
 
     tool_call_text = '<tool_call>\n{"name": "search", "arguments": {"b": 2, "a": 1}}\n</tool_call>'
@@ -338,11 +377,43 @@ async def test_gateway_actor_tool_argument_format_drift_splits_after_valid_conti
     trajectories = ray.get(actor.finalize_session.remote("session-tool-arg-drift"))
     ray.get(actor.shutdown.remote())
 
-    assert len(trajectories) == 2
+    assert len(trajectories) == 1
     assert trajectories[0].trajectory_id == 0
-    assert trajectories[1].trajectory_id == 1
     assert 0 in trajectories[0].response_mask
-    assert trajectories[1].response_mask == [1] * len("THIRD")
+    assert trajectories[0].response_mask[-len("THIRD") :] == [1] * len("THIRD")
+
+
+def test_message_prefix_falls_back_to_raw_tool_argument_value_comparison_when_arguments_are_invalid_json():
+    from verl.agent.gateway.gateway import _is_message_prefix
+
+    prefix = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "search", "arguments": "{\"query\": weather}"},
+                }
+            ],
+        }
+    ]
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "search", "arguments": "{\"query\": sunny}"},
+                }
+            ],
+        }
+    ]
+
+    assert _is_message_prefix(prefix, messages) is False
 
 
 @pytest.mark.asyncio

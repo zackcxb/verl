@@ -70,6 +70,8 @@ async def test_gateway_serving_runtime_injects_runtime_owned_gateway_backend(ray
         gateway_actor_kwargs={
             "tokenizer": FakeTokenizer(),
             "host": "127.0.0.1",
+            "base_sampling_params": {"temperature": 0.4, "top_p": 0.8},
+            "allowed_request_sampling_param_keys": {"temperature", "top_k"},
         },
     )
 
@@ -77,7 +79,13 @@ async def test_gateway_serving_runtime_injects_runtime_owned_gateway_backend(ray
     async with httpx.AsyncClient(timeout=5.0) as client:
         response = await client.post(
             f"{session.base_url}/chat/completions",
-            json={"model": "dummy-model", "messages": [{"role": "user", "content": "managed path"}]},
+            json={
+                "model": "dummy-model",
+                "temperature": 0.2,
+                "top_k": 4,
+                "presence_penalty": 1.5,
+                "messages": [{"role": "user", "content": "managed path"}],
+            },
         )
         assert response.status_code == 200
         assert response.json()["choices"][0]["message"]["content"] == "MANAGED"
@@ -93,6 +101,7 @@ async def test_gateway_serving_runtime_injects_runtime_owned_gateway_backend(ray
     assert stats["release_calls"] == ["server-0"]
     assert len(calls) == 1
     assert calls[0]["prompt_ids"]
+    assert calls[0]["sampling_params"] == {"temperature": 0.2, "top_p": 0.8, "top_k": 4}
 
 
 @pytest.mark.asyncio

@@ -258,12 +258,132 @@ async def test_openai_compatible_framework_aborts_session_on_agent_error():
     )
     framework._build_session_id = lambda prompts, sample_index: session_id
 
-    with pytest.raises(RuntimeError, match="agent failed"):
+    with pytest.raises(RuntimeError, match="All sessions failed") as exc_info:
         await framework.generate_sequences(prompts)
 
     assert runtime.created_sessions == [session_id]
     assert runtime.aborted_sessions == [session_id]
     assert runtime.finalized_sessions == []
+    assert isinstance(exc_info.value.__cause__, RuntimeError)
+    assert str(exc_info.value.__cause__) == "agent failed"
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_framework_drops_failed_samples_but_keeps_successful_ones():
+    from verl.agent.framework.framework import OpenAICompatibleAgentFramework
+    from verl.agent.framework.types import SessionRewardContext
+
+    prompts = _build_prompts(
+        raw_prompt=[
+            [{"role": "user", "content": "sample 0"}],
+            [{"role": "user", "content": "sample 1"}],
+        ],
+        uid=["sample-0", "sample-1"],
+    )
+    session_ids = {
+        0: "session-success",
+        1: "session-failure",
+    }
+    runtime = _FakeSessionRuntime(
+        {
+            session_ids[0]: [
+                _build_trajectory(
+                    uid="sample-0",
+                    session_id=session_ids[0],
+                    trajectory_id=0,
+                    prompt_ids=[1],
+                    response_ids=[2, 3],
+                    response_mask=[1, 1],
+                    reward_info={"label": "kept"},
+                )
+            ],
+            session_ids[1]: [],
+        }
+    )
+    reward_calls = []
+
+    async def agent_runner(*, raw_prompt, session, sample_index):
+        assert raw_prompt == [{"role": "user", "content": f"sample {sample_index}"}]
+        if sample_index == 1:
+            raise RuntimeError("agent failed sample-1")
+
+    def reward_fn(ctx: SessionRewardContext) -> list[float]:
+        reward_calls.append(ctx.sample_fields["uid"])
+        return [1.0]
+
+    framework = OpenAICompatibleAgentFramework(
+        session_runtime=runtime,
+        agent_runner=agent_runner,
+        reward_fn=reward_fn,
+    )
+    framework._build_session_id = lambda prompts, sample_index: session_ids[sample_index]
+
+    output = await framework.generate_sequences(prompts)
+
+    assert set(runtime.created_sessions) == set(session_ids.values())
+    assert runtime.finalized_sessions == [session_ids[0]]
+    assert runtime.aborted_sessions == [session_ids[1]]
+    assert reward_calls == ["sample-0"]
+    assert tu.get(output, "uid") == ["sample-0"]
+    assert tu.get(output, "label") == ["kept"]
+    assert len(output) == 1
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_framework_raises_when_all_samples_fail_without_calling_assembler():
+    from verl.agent.framework.framework import OpenAICompatibleAgentFramework
+
+    prompts = _build_prompts(
+        raw_prompt=[
+            [{"role": "user", "content": "sample 0"}],
+            [{"role": "user", "content": "sample 1"}],
+        ],
+    )
+    session_ids = {
+        0: "session-failure-0",
+        1: "session-failure-1",
+    }
+    runtime = _FakeSessionRuntime(
+        {
+            session_ids[0]: [],
+            session_ids[1]: [],
+        }
+    )
+
+    class _SpyAssembler:
+        def __init__(self):
+            self.calls = []
+
+        def assemble(self, trajectories):
+            self.calls.append(list(trajectories))
+            raise AssertionError("assemble should not be called when all samples fail")
+
+    assembler = _SpyAssembler()
+    reward_calls = []
+
+    async def agent_runner(*, raw_prompt, session, sample_index):
+        raise RuntimeError(f"agent failed sample-{sample_index}")
+
+    def reward_fn(ctx):
+        reward_calls.append(ctx)
+        return []
+
+    framework = OpenAICompatibleAgentFramework(
+        session_runtime=runtime,
+        agent_runner=agent_runner,
+        reward_fn=reward_fn,
+        assembler=assembler,
+    )
+    framework._build_session_id = lambda prompts, sample_index: session_ids[sample_index]
+
+    with pytest.raises(RuntimeError, match="All sessions failed"):
+        await framework.generate_sequences(prompts)
+
+    assert set(runtime.created_sessions) == set(session_ids.values())
+    assert set(runtime.aborted_sessions) == set(session_ids.values())
+    assert runtime.finalized_sessions == []
+    assert assembler.calls == []
+    assert reward_calls == []
 
 
 @pytest.mark.asyncio
