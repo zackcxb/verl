@@ -8,12 +8,17 @@ import ray
 
 from tests.agent.support import (
     FailingBackend,
+    FakeProcessor,
     FakeTokenizer,
+    InspectingBackend,
+    InspectingSequencedBackend,
     QueuedBackend,
     RejectConcurrentSessionBackend,
     RejectRequestEnvelopeBackend,
     RejectToolsSamplingParamsBackend,
     SequencedBackend,
+    SingleUseVisionInfoExtractor,
+    fake_vision_info_extractor,
 )
 
 
@@ -24,7 +29,7 @@ def ray_runtime():
     ray.shutdown()
 
 
-def test_normalize_request_context_preserves_structured_fields():
+def test_normalize_request_context_preserves_multimodal_blocks_for_later_extraction():
     from verl.agent.gateway.gateway import _normalize_request_context
 
     context = _normalize_request_context(
@@ -65,6 +70,66 @@ def test_normalize_request_context_preserves_structured_fields():
 
 
 @pytest.mark.asyncio
+async def test_gateway_actor_forwards_image_data_on_initial_multimodal_request(ray_runtime):
+    from verl.agent.gateway.gateway import GatewayActor, _normalize_request_context
+
+    processor = FakeProcessor()
+    actor = GatewayActor.remote(
+        tokenizer=FakeTokenizer(),
+        processor=processor,
+        vision_info_extractor=fake_vision_info_extractor,
+        backend=InspectingBackend(),
+        host="127.0.0.1",
+    )
+    ray.get(actor.start.remote())
+
+    session = ray.get(actor.create_session.remote("session-mm-initial"))
+    payload = {
+        "model": "dummy-model",
+        "temperature": 0.25,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": "image://a.png"}},
+                    {"type": "text", "text": "describe this image"},
+                ],
+            }
+        ],
+    }
+
+    normalized = _normalize_request_context(payload)
+    raw_prompt = processor.apply_chat_template(
+        normalized["messages"],
+        tokenize=False,
+        add_generation_prompt=True,
+        tools=normalized["tools"],
+    )
+    expected_prompt_ids = processor(
+        text=[raw_prompt],
+        images=["image://a.png"],
+        videos=None,
+        return_tensors="pt",
+        do_sample_frames=False,
+    )["input_ids"][0]
+
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        response = await client.post(
+            f"{session.base_url}/chat/completions",
+            json=payload,
+        )
+
+    ray.get(actor.shutdown.remote())
+
+    assert response.status_code == 200
+    backend_request = json.loads(response.json()["choices"][0]["message"]["content"])
+    assert backend_request["image_data"] == ["image://a.png"]
+    assert backend_request["video_data"] is None
+    assert backend_request["prompt_ids"] == expected_prompt_ids
+    assert backend_request["sampling_params"] == {"temperature": 0.25}
+
+
+@pytest.mark.asyncio
 async def test_gateway_actor_complete_wait_and_finalize(ray_runtime):
     from verl.agent.gateway.gateway import GatewayActor
 
@@ -100,6 +165,213 @@ async def test_gateway_actor_complete_wait_and_finalize(ray_runtime):
     assert trajectories[0].trajectory_id == 0
     assert trajectories[0].response_ids
     assert all(mask == 1 for mask in trajectories[0].response_mask)
+
+
+@pytest.mark.asyncio
+async def test_gateway_actor_continuation_reuses_accumulated_media_context(ray_runtime):
+    from verl.agent.gateway.gateway import GatewayActor
+
+    actor = GatewayActor.remote(
+        tokenizer=FakeTokenizer(),
+        processor=FakeProcessor(),
+        vision_info_extractor=SingleUseVisionInfoExtractor(),
+        backend=InspectingBackend(),
+        host="127.0.0.1",
+    )
+    ray.get(actor.start.remote())
+    session = ray.get(actor.create_session.remote("session-mm-continuation"))
+
+    initial_message = {
+        "role": "user",
+        "content": [
+            {"type": "image_url", "image_url": {"url": "image://a.png"}},
+            {"type": "text", "text": "describe this image"},
+        ],
+    }
+
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        first = await client.post(
+            f"{session.base_url}/chat/completions",
+            json={
+                "model": "dummy-model",
+                "messages": [initial_message],
+            },
+        )
+        assert first.status_code == 200
+        assistant_message = first.json()["choices"][0]["message"]
+
+        second = await client.post(
+            f"{session.base_url}/chat/completions",
+            json={
+                "model": "dummy-model",
+                "messages": [
+                    initial_message,
+                    assistant_message,
+                    {"role": "user", "content": "follow up"},
+                ],
+            },
+        )
+
+    trajectories = ray.get(actor.finalize_session.remote("session-mm-continuation"))
+    ray.get(actor.shutdown.remote())
+
+    assert second.status_code == 200
+    first_call = json.loads(first.json()["choices"][0]["message"]["content"])
+    second_call = json.loads(second.json()["choices"][0]["message"]["content"])
+    assert first_call["image_data"] == ["image://a.png"]
+    assert second_call["image_data"] == ["image://a.png"]
+    assert len(trajectories) == 1
+
+
+@pytest.mark.asyncio
+async def test_gateway_actor_multimodal_reference_change_splits_trajectory(ray_runtime):
+    from verl.agent.gateway.gateway import GatewayActor
+
+    actor = GatewayActor.remote(
+        tokenizer=FakeTokenizer(),
+        processor=FakeProcessor(),
+        vision_info_extractor=fake_vision_info_extractor,
+        backend=InspectingBackend(),
+        host="127.0.0.1",
+    )
+    ray.get(actor.start.remote())
+    session = ray.get(actor.create_session.remote("session-mm-split"))
+
+    first_payload = {
+        "model": "dummy-model",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": "image://a.png"}},
+                    {"type": "text", "text": "describe image a"},
+                ],
+            }
+        ],
+    }
+    second_payload = {
+        "model": "dummy-model",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": "image://b.png"}},
+                    {"type": "text", "text": "describe image b"},
+                ],
+            }
+        ],
+    }
+
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        first = await client.post(f"{session.base_url}/chat/completions", json=first_payload)
+        second = await client.post(f"{session.base_url}/chat/completions", json=second_payload)
+
+    trajectories = ray.get(actor.finalize_session.remote("session-mm-split"))
+    ray.get(actor.shutdown.remote())
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    first_call = json.loads(first.json()["choices"][0]["message"]["content"])
+    second_call = json.loads(second.json()["choices"][0]["message"]["content"])
+    assert first_call["image_data"] == ["image://a.png"]
+    assert second_call["image_data"] == ["image://b.png"]
+    assert len(trajectories) == 2
+
+
+@pytest.mark.asyncio
+async def test_gateway_actor_continuation_with_tool_returned_image_appends_media(ray_runtime):
+    from verl.utils.chat_template import apply_chat_template, initialize_system_prompt
+    from verl.agent.gateway.gateway import GatewayActor
+
+    processor = FakeProcessor()
+    tool_call_text = '<tool_call>\n{"name": "search", "arguments": {"query": "crop"}}\n</tool_call>'
+    actor = GatewayActor.remote(
+        tokenizer=FakeTokenizer(),
+        processor=processor,
+        vision_info_extractor=fake_vision_info_extractor,
+        backend=InspectingSequencedBackend([tool_call_text, "__inspect__"]),
+        host="127.0.0.1",
+        tool_parser_name="hermes",
+    )
+    ray.get(actor.start.remote())
+    session = ray.get(actor.create_session.remote("session-mm-tool-image"))
+
+    tools = [{"type": "function", "function": {"name": "search", "parameters": {"type": "object"}}}]
+    initial_message = {
+        "role": "user",
+        "content": [
+            {"type": "image_url", "image_url": {"url": "image://a.png"}},
+            {"type": "text", "text": "find a crop"},
+        ],
+    }
+
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        first = await client.post(
+            f"{session.base_url}/chat/completions",
+            json={
+                "model": "dummy-model",
+                "tools": tools,
+                "messages": [initial_message],
+            },
+        )
+        assert first.status_code == 200
+        assistant_message = first.json()["choices"][0]["message"]
+        tool_message = {
+            "role": "tool",
+            "tool_call_id": assistant_message["tool_calls"][0]["id"],
+            "content": [
+                {"type": "image_url", "image_url": {"url": "image://tool-b.png"}},
+                {"type": "text", "text": "zoomed crop"},
+            ],
+        }
+
+        second = await client.post(
+            f"{session.base_url}/chat/completions",
+            json={
+                "model": "dummy-model",
+                "tools": tools,
+                "messages": [initial_message, assistant_message, tool_message],
+            },
+        )
+
+    ray.get(actor.shutdown.remote())
+
+    assert second.status_code == 200
+    second_call = json.loads(second.json()["choices"][0]["message"]["content"])
+    assert second_call["image_data"] == ["image://a.png", "image://tool-b.png"]
+
+    initial_raw_prompt = apply_chat_template(
+        processor,
+        [initial_message],
+        tools=tools,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    initial_prompt_ids = processor(
+        text=[initial_raw_prompt],
+        images=["image://a.png"],
+        videos=None,
+        return_tensors="pt",
+        do_sample_frames=False,
+    )["input_ids"][0]
+
+    incremental_raw_prompt = apply_chat_template(
+        processor,
+        [tool_message],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    incremental_prompt_ids = processor(
+        text=[incremental_raw_prompt],
+        images=["image://tool-b.png"],
+        videos=None,
+        return_tensors="pt",
+        do_sample_frames=False,
+    )["input_ids"][0]
+    system_prompt = initialize_system_prompt(processor)
+    expected_incremental_ids = incremental_prompt_ids[len(system_prompt) :]
+    expected_prompt_ids = initial_prompt_ids + [ord(char) for char in tool_call_text] + expected_incremental_ids
+    assert second_call["prompt_ids"] == expected_prompt_ids
 
 
 @pytest.mark.asyncio

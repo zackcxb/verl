@@ -30,6 +30,8 @@ class GatewaySessionState:
     metadata: dict[str, Any] = field(default_factory=dict)
     request_tools: list[dict[str, Any]] | None = None
     message_history: list[dict[str, Any]] = field(default_factory=list)
+    image_data: list[Any] | None = None
+    video_data: list[Any] | None = None
     active_trajectory: TrajectoryBuffer | None = None
     trajectories: list[Trajectory] = field(default_factory=list)
     reward_info: dict[str, Any] = field(default_factory=dict)
