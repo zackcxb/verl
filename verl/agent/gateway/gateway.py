@@ -200,6 +200,18 @@ def _materialize_response_logprobs(buffer: TrajectoryBuffer) -> list[float] | No
     return list(buffer.response_logprobs)
 
 
+def _build_multi_modal_trajectory_data(
+    image_data: list[Any] | None,
+    video_data: list[Any] | None,
+) -> dict[str, Any] | None:
+    multi_modal_data: dict[str, Any] = {}
+    if image_data:
+        multi_modal_data["images"] = list(image_data)
+    if video_data:
+        multi_modal_data["videos"] = list(video_data)
+    return multi_modal_data or None
+
+
 class _GatewayActor:
     def __init__(
         self,
@@ -311,6 +323,7 @@ class _GatewayActor:
             response_logprobs=_materialize_response_logprobs(active),
             reward_info={},
             num_turns=_count_chat_turns(session.message_history),
+            multi_modal_data=_build_multi_modal_trajectory_data(session.image_data, session.video_data),
         )
 
     async def _default_vision_info_extractor(

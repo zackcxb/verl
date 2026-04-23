@@ -111,7 +111,7 @@ async def test_gateway_actor_forwards_image_data_on_initial_multimodal_request(r
         videos=None,
         return_tensors="pt",
         do_sample_frames=False,
-    )["input_ids"][0]
+    )["input_ids"][0].tolist()
 
     async with httpx.AsyncClient(timeout=5.0) as client:
         response = await client.post(
@@ -119,6 +119,7 @@ async def test_gateway_actor_forwards_image_data_on_initial_multimodal_request(r
             json=payload,
         )
 
+    trajectories = ray.get(actor.finalize_session.remote("session-mm-initial"))
     ray.get(actor.shutdown.remote())
 
     assert response.status_code == 200
@@ -127,6 +128,8 @@ async def test_gateway_actor_forwards_image_data_on_initial_multimodal_request(r
     assert backend_request["video_data"] is None
     assert backend_request["prompt_ids"] == expected_prompt_ids
     assert backend_request["sampling_params"] == {"temperature": 0.25}
+    assert len(trajectories) == 1
+    assert trajectories[0].multi_modal_data == {"images": ["image://a.png"]}
 
 
 @pytest.mark.asyncio
@@ -221,6 +224,7 @@ async def test_gateway_actor_continuation_reuses_accumulated_media_context(ray_r
     assert first_call["image_data"] == ["image://a.png"]
     assert second_call["image_data"] == ["image://a.png"]
     assert len(trajectories) == 1
+    assert trajectories[0].multi_modal_data == {"images": ["image://a.png"]}
 
 
 @pytest.mark.asyncio
@@ -334,11 +338,16 @@ async def test_gateway_actor_continuation_with_tool_returned_image_appends_media
             },
         )
 
+    trajectories = ray.get(actor.finalize_session.remote("session-mm-tool-image"))
     ray.get(actor.shutdown.remote())
 
     assert second.status_code == 200
     second_call = json.loads(second.json()["choices"][0]["message"]["content"])
     assert second_call["image_data"] == ["image://a.png", "image://tool-b.png"]
+    assert len(trajectories) == 1
+    assert trajectories[0].multi_modal_data == {
+        "images": ["image://a.png", "image://tool-b.png"],
+    }
 
     initial_raw_prompt = apply_chat_template(
         processor,
@@ -353,7 +362,7 @@ async def test_gateway_actor_continuation_with_tool_returned_image_appends_media
         videos=None,
         return_tensors="pt",
         do_sample_frames=False,
-    )["input_ids"][0]
+    )["input_ids"][0].tolist()
 
     incremental_raw_prompt = apply_chat_template(
         processor,
@@ -367,7 +376,7 @@ async def test_gateway_actor_continuation_with_tool_returned_image_appends_media
         videos=None,
         return_tensors="pt",
         do_sample_frames=False,
-    )["input_ids"][0]
+    )["input_ids"][0].tolist()
     system_prompt = initialize_system_prompt(processor)
     expected_incremental_ids = incremental_prompt_ids[len(system_prompt) :]
     expected_prompt_ids = initial_prompt_ids + [ord(char) for char in tool_call_text] + expected_incremental_ids

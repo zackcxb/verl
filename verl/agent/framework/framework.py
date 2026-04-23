@@ -46,6 +46,7 @@ class OpenAICompatibleAgentFramework(AgentFramework):
         agent_runner,
         reward_fn: RewardFn,
         *,
+        processor=None,
         assembler: TrajectoryAssembler | None = None,
         pad_token_id: int = 0,
         completion_timeout: float | None = 30.0,
@@ -54,6 +55,7 @@ class OpenAICompatibleAgentFramework(AgentFramework):
         self.session_runtime = session_runtime
         self.agent_runner = agent_runner
         self.reward_fn = reward_fn
+        self._processor = processor
         self.assembler = assembler or TrajectoryAssembler(pad_token_id=pad_token_id)
         self.completion_timeout = completion_timeout
         self.wait_for_completion_after_agent_run = wait_for_completion_after_agent_run
@@ -94,6 +96,10 @@ class OpenAICompatibleAgentFramework(AgentFramework):
             raise ValueError("Successful sessions produced no trajectories")
 
         assembled = self.assembler.assemble(all_trajectories)
+        if self._processor is not None:
+            from verl.agent.framework.multi_modal_postprocess import apply_multi_modal_postprocess
+
+            assembled = apply_multi_modal_postprocess(assembled, all_trajectories, self._processor)
         result = assembled.copy()
         for key, values in expanded_non_tensor_batch.items():
             tu.assign_non_tensor(result, **{key: values})

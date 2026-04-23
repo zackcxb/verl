@@ -12,6 +12,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import pathlib
+import sys
+
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 import httpx
 import ray
@@ -35,13 +41,14 @@ async def main(mode: str) -> None:
     ray.init(ignore_reinit_error=True)
     rollout_server = RecordingRolloutServer.remote("DEEPEYES-SMOKE")
     load_balancer = RecordingLoadBalancer.remote("server-0")
+    processor = FakeProcessor()
     runtime = GatewayServingRuntime(
         servers=[("server-0", rollout_server)],
         load_balancer_handle=load_balancer,
         gateway_count=1,
         gateway_actor_kwargs={
             "tokenizer": FakeTokenizer(),
-            "processor": FakeProcessor(),
+            "processor": processor,
             "vision_info_extractor": fake_vision_info_extractor,
             "host": "127.0.0.1",
         },
@@ -84,6 +91,7 @@ async def main(mode: str) -> None:
         session_runtime=runtime,
         agent_runner=agent_runner,
         reward_fn=reward_fn,
+        processor=processor,
     )
     framework._build_session_id = lambda prompts, sample_index: "deepeyes-smoke-session"
 
@@ -91,12 +99,16 @@ async def main(mode: str) -> None:
         output = await framework.generate_sequences(prompts)
         calls = ray.get(rollout_server.get_calls.remote())
         stats = ray.get(load_balancer.stats.remote())
+        multi_modal_inputs = tu.get(output, "multi_modal_inputs")
         summary = {
             "num_trajectories": len(output),
             "uid": tu.get(output, "uid"),
             "data_source": tu.get(output, "data_source"),
             "image_data": calls[0]["image_data"],
             "video_data": calls[0]["video_data"],
+            "multi_modal_data": tu.get(output, "multi_modal_data"),
+            "multi_modal_inputs_keys": [sorted(sample_inputs.keys()) for sample_inputs in multi_modal_inputs],
+            "position_ids_shape": list(output["position_ids"].shape),
             "response_shape": list(output["responses"].shape),
             "load_balancer": stats,
         }

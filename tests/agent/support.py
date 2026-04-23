@@ -2,6 +2,7 @@ import asyncio
 import json
 
 import ray
+import torch
 
 from verl.agent.framework.types import SessionHandle, Trajectory
 from verl.workers.rollout.replica import TokenOutput
@@ -20,7 +21,14 @@ class FakeTokenizer:
         return text
 
     def decode(self, token_ids, skip_special_tokens=True):
-        return "".join(chr(token_id) for token_id in token_ids)
+        if hasattr(token_ids, "tolist"):
+            token_ids = token_ids.tolist()
+        normalized = []
+        for token_id in token_ids:
+            if hasattr(token_id, "item"):
+                token_id = token_id.item()
+            normalized.append(int(token_id))
+        return "".join(chr(token_id) for token_id in normalized)
 
     def encode(self, text, add_special_tokens=False):
         return [ord(char) for char in text]
@@ -37,9 +45,14 @@ class FakeProcessor:
     class _ImageProcessor:
         patch_size = 16
 
+    image_token_id = 32001
+    video_token_id = 32002
+
     def __init__(self):
         self.image_processor = self._ImageProcessor()
         self.tokenizer = FakeTokenizer()
+        self.last_processor_call = None
+        self.last_get_rope_index_call = None
 
     def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=True, tools=None, **kwargs):
         return self.tokenizer.apply_chat_template(
@@ -62,12 +75,72 @@ class FakeProcessor:
         **kwargs,
     ):
         assert len(text) == 1
-        prompt = text[0]
+        self.last_processor_call = {
+            "text": list(text),
+            "images": None if images is None else list(images),
+            "videos": None if videos is None else list(videos),
+            "video_metadata": None if video_metadata is None else list(video_metadata),
+            "return_tensors": return_tensors,
+            "do_sample_frames": do_sample_frames,
+        }
+
+        prompt_ids = self.tokenizer.encode(text[0], add_special_tokens=False)
         if images:
-            prompt += f"|images={json.dumps(images)}"
+            prompt_ids.extend([self.image_token_id] * len(images))
         if videos:
-            prompt += f"|videos={json.dumps(videos)}"
-        return {"input_ids": [[ord(char) for char in prompt]]}
+            prompt_ids.extend([self.video_token_id] * len(videos))
+
+        input_ids = torch.tensor([prompt_ids], dtype=torch.long)
+        attention_mask = torch.ones_like(input_ids)
+        output = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+        }
+
+        if images:
+            image_count = len(images)
+            output["pixel_values"] = torch.arange(image_count * 12, dtype=torch.float32).reshape(image_count, 3, 2, 2)
+            output["image_grid_thw"] = torch.tensor([[1, 2, 3]] * image_count, dtype=torch.long)
+            output["mm_token_type_ids"] = torch.ones_like(input_ids)
+
+        if videos:
+            video_count = len(videos)
+            output["pixel_values_videos"] = torch.arange(video_count * 24, dtype=torch.float32).reshape(
+                video_count, 3, 2, 4
+            )
+            output["video_grid_thw"] = torch.tensor([[1, 3, 4]] * video_count, dtype=torch.long)
+            output["mm_token_type_ids"] = torch.ones_like(input_ids)
+
+        return output
+
+    def get_rope_index(
+        self,
+        *,
+        input_ids,
+        attention_mask,
+        image_grid_thw=None,
+        video_grid_thw=None,
+        mm_token_type_ids=None,
+        **kwargs,
+    ):
+        self.last_get_rope_index_call = {
+            "input_ids": input_ids.clone(),
+            "attention_mask": attention_mask.clone(),
+            "image_grid_thw": None if image_grid_thw is None else image_grid_thw.clone(),
+            "video_grid_thw": None if video_grid_thw is None else video_grid_thw.clone(),
+            "mm_token_type_ids": None if mm_token_type_ids is None else mm_token_type_ids.clone(),
+        }
+        seq_len = input_ids.shape[1]
+        base = torch.arange(seq_len, dtype=torch.long, device=input_ids.device)
+        vision_position_ids = torch.stack(
+            [
+                base + 100,
+                base + 200,
+                base + 300,
+            ],
+            dim=0,
+        ).unsqueeze(1)
+        return vision_position_ids, None
 
 
 async def fake_vision_info_extractor(messages, image_patch_size, config=None):
