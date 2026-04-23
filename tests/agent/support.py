@@ -39,10 +39,10 @@ class FakeProcessor:
 
     def __init__(self):
         self.image_processor = self._ImageProcessor()
-        self._tokenizer = FakeTokenizer()
+        self.tokenizer = FakeTokenizer()
 
     def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=True, tools=None, **kwargs):
-        return self._tokenizer.apply_chat_template(
+        return self.tokenizer.apply_chat_template(
             messages,
             tokenize=tokenize,
             add_generation_prompt=add_generation_prompt,

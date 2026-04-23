@@ -91,10 +91,23 @@ the default GPU unit-test workflow.
     - Verifies the runtime can own gateway actor lifecycle plus session creation, wait, completion, and finalization behavior.
   - `test_gateway_serving_runtime_injects_runtime_owned_gateway_backend`
     - Verifies runtime-owned gateways use the runtime itself as backend and correctly apply gateway-owned base sampling params plus whitelisted request overrides before calling the rollout server.
+  - `test_gateway_serving_runtime_passes_processor_and_media_to_owned_gateway`
+    - Verifies runtime-owned gateways accept processor-aware actor kwargs and forward extracted multimodal media to the rollout server.
   - `test_gateway_serving_runtime_releases_server_when_generate_fails`
     - Verifies backend-server slots are still released when `generate()` raises, preventing load-balancer bookkeeping leaks.
   - `test_gateway_serving_runtime_gateway_count_zero_falls_back_to_generate_only_mode`
     - Verifies `gateway_count=0` still supports direct `generate()` requests without creating owned gateway actors or a session runtime.
+
+### Integration
+
+- `integration/test_framework_gateway_multimodal_on_cpu.py`
+  - `test_framework_runs_multimodal_session_through_gateway_runtime`
+    - Verifies `OpenAICompatibleAgentFramework` can drive a real `GatewayServingRuntime` session with a multimodal prompt plus tool schema and that the rollout server receives forwarded `image_data`.
+
+### Smoke
+
+- `smoke/deepeyes_multimodal_smoke.py`
+  - Standalone script (not pytest) that validates the full Framework → Runtime → Gateway → Backend multimodal path using stub components. Run with `python tests/agent/smoke/deepeyes_multimodal_smoke.py --mode stub`.
 
 ## Mocking boundaries
 

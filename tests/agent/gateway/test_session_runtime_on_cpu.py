@@ -4,10 +4,12 @@ import ray
 
 from tests.agent.support import (
     FailingRolloutServer,
+    FakeProcessor,
     FakeTokenizer,
     QueuedBackend,
     RecordingLoadBalancer,
     RecordingRolloutServer,
+    fake_vision_info_extractor,
 )
 
 
@@ -102,6 +104,55 @@ async def test_gateway_serving_runtime_injects_runtime_owned_gateway_backend(ray
     assert len(calls) == 1
     assert calls[0]["prompt_ids"]
     assert calls[0]["sampling_params"] == {"temperature": 0.2, "top_p": 0.8, "top_k": 4}
+
+
+@pytest.mark.asyncio
+async def test_gateway_serving_runtime_passes_processor_and_media_to_owned_gateway(ray_runtime):
+    from verl.agent.gateway.runtime import GatewayServingRuntime
+
+    rollout_server = RecordingRolloutServer.remote("MM")
+    load_balancer = RecordingLoadBalancer.remote("server-0")
+    runtime = GatewayServingRuntime(
+        servers=[("server-0", rollout_server)],
+        load_balancer_handle=load_balancer,
+        gateway_count=1,
+        gateway_actor_kwargs={
+            "tokenizer": FakeTokenizer(),
+            "processor": FakeProcessor(),
+            "vision_info_extractor": fake_vision_info_extractor,
+            "host": "127.0.0.1",
+        },
+    )
+
+    session = await runtime.create_session("session-runtime-processor")
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        response = await client.post(
+            f"{session.base_url}/chat/completions",
+            json={
+                "model": "dummy-model",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url", "image_url": {"url": "image://runtime.png"}},
+                            {"type": "text", "text": "describe this image"},
+                        ],
+                    }
+                ],
+            },
+        )
+        assert response.status_code == 200
+        assert response.json()["choices"][0]["message"]["content"] == "MM"
+
+    trajectories = await runtime.finalize_session("session-runtime-processor")
+    await runtime.shutdown()
+
+    calls = ray.get(rollout_server.get_calls.remote())
+
+    assert len(trajectories) == 1
+    assert len(calls) == 1
+    assert calls[0]["image_data"] == ["image://runtime.png"]
+    assert calls[0]["video_data"] is None
 
 
 @pytest.mark.asyncio
