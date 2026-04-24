@@ -200,18 +200,6 @@ def _materialize_response_logprobs(buffer: TrajectoryBuffer) -> list[float] | No
     return list(buffer.response_logprobs)
 
 
-def _build_multi_modal_trajectory_data(
-    image_data: list[Any] | None,
-    video_data: list[Any] | None,
-) -> dict[str, Any] | None:
-    multi_modal_data: dict[str, Any] = {}
-    if image_data:
-        multi_modal_data["images"] = list(image_data)
-    if video_data:
-        multi_modal_data["videos"] = list(video_data)
-    return multi_modal_data or None
-
-
 class _GatewayActor:
     def __init__(
         self,
@@ -219,9 +207,6 @@ class _GatewayActor:
         backend,
         host: str | None = None,
         *,
-        processor=None,
-        vision_info_extractor=None,
-        vision_info_extractor_kwargs: dict[str, Any] | None = None,
         tool_parser_name: str | None = None,
         apply_chat_template_kwargs: dict[str, Any] | None = None,
         base_sampling_params: dict[str, Any] | None = None,
@@ -231,10 +216,7 @@ class _GatewayActor:
         # use the node's routable IP for both bind and URL by default.
         self._server_address = host if host is not None else ray.util.get_node_ip_address()
         self._tokenizer = tokenizer
-        self._processor = processor
         self._backend = backend
-        self._vision_info_extractor = vision_info_extractor or self._default_vision_info_extractor
-        self._vision_info_extractor_kwargs = dict(vision_info_extractor_kwargs or {})
         self._apply_chat_template_kwargs = apply_chat_template_kwargs or {}
         self._base_sampling_params = dict(base_sampling_params or {})
         allowed_keys = (
@@ -243,10 +225,7 @@ class _GatewayActor:
             else frozenset(allowed_request_sampling_param_keys)
         )
         self._allowed_request_sampling_param_keys = allowed_keys
-        self._system_prompt = initialize_system_prompt(
-            tokenizer,
-            **self._apply_chat_template_kwargs,
-        )
+        self._system_prompt = initialize_system_prompt(tokenizer, **self._apply_chat_template_kwargs)
         self._tool_parser = (
             ToolParser.get_tool_parser(tool_parser_name, tokenizer) if tool_parser_name else None
         )
@@ -323,85 +302,11 @@ class _GatewayActor:
             response_logprobs=_materialize_response_logprobs(active),
             reward_info={},
             num_turns=_count_chat_turns(session.message_history),
-            multi_modal_data=_build_multi_modal_trajectory_data(session.image_data, session.video_data),
         )
 
-    async def _default_vision_info_extractor(
-        self,
-        messages: list[dict[str, Any]],
-        *,
-        image_patch_size: int,
-    ) -> tuple[list[Any] | None, list[Any] | None]:
-        # Keep the dataset dependency lazy so custom extractors do not pay for
-        # RLHFDataset imports unless they actually use the default path.
-        from verl.utils.dataset.rl_dataset import RLHFDataset
-
-        return await RLHFDataset.process_vision_info(
-            messages,
-            image_patch_size=image_patch_size,
-            config=self._vision_info_extractor_kwargs.get("config"),
-        )
-
-    async def _extract_multi_modal_data(
-        self,
-        messages: list[dict[str, Any]],
-    ) -> tuple[list[Any] | None, list[Any] | None]:
-        if self._processor is None:
-            return None, None
-
-        has_multi_modal_blocks = False
-        for message in messages:
-            content = message.get("content")
-            if not isinstance(content, list):
-                continue
-            for part in content:
-                if isinstance(part, dict) and part.get("type") in {"image", "image_url", "video", "video_url"}:
-                    has_multi_modal_blocks = True
-                    break
-            if has_multi_modal_blocks:
-                break
-
-        if not has_multi_modal_blocks:
-            return None, None
-
-        return await self._vision_info_extractor(
-            messages,
-            image_patch_size=self._processor.image_processor.patch_size,
-            **self._vision_info_extractor_kwargs,
-        )
-
-    def _encode_full(
-        self,
-        messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]] | None = None,
-        image_data: list[Any] | None = None,
-        video_data: list[Any] | None = None,
-    ) -> list[int]:
+    def _encode_full(self, messages: list[dict[str, Any]],
+                     tools: list[dict[str, Any]] | None = None) -> list[int]:
         """Encode a full conversation for a new trajectory (includes system prompt + generation prompt)."""
-        if self._processor is not None:
-            raw_prompt = _apply_chat_template(
-                self._processor,
-                messages,
-                tools=tools,
-                add_generation_prompt=True,
-                tokenize=False,
-                **self._apply_chat_template_kwargs,
-            )
-            videos = video_data
-            video_metadata = None
-            if videos is not None:
-                videos, video_metadata = zip(*videos, strict=False)
-                videos, video_metadata = list(videos), list(video_metadata)
-            model_inputs = self._processor(
-                text=[raw_prompt],
-                images=image_data,
-                videos=videos,
-                video_metadata=video_metadata,
-                return_tensors="pt",
-                do_sample_frames=False,
-            )
-            return normalize_token_ids(model_inputs["input_ids"])
-
         return normalize_token_ids(
             _apply_chat_template(
                 self._tokenizer, messages, tools=tools, add_generation_prompt=True,
@@ -409,47 +314,19 @@ class _GatewayActor:
             )
         )
     # TODO: check if delta tokenization is better than remove_system_prompt
-    def _encode_incremental(
-        self,
-        messages: list[dict[str, Any]],
-        image_data: list[Any] | None = None,
-        video_data: list[Any] | None = None,
-    ) -> list[int]:
+    def _encode_incremental(self, messages: list[dict[str, Any]]) -> list[int]:
         """Encode incremental messages (tool results, user follow-ups) for a continuation turn.
 
         Uses the remove_system_prompt pattern from ToolAgentLoop: encode the new messages
         alone (which prepends a system prompt), then strip the known system_prompt prefix.
         No tools parameter — tool schema is already in the initial prompt_ids.
         """
-        if self._processor is not None:
-            raw_prompt = _apply_chat_template(
-                self._processor,
-                messages,
-                add_generation_prompt=True,
-                tokenize=False,
+        ids = normalize_token_ids(
+            _apply_chat_template(
+                self._tokenizer, messages, add_generation_prompt=True,
                 **self._apply_chat_template_kwargs,
             )
-            videos = video_data
-            video_metadata = None
-            if videos is not None:
-                videos, video_metadata = zip(*videos, strict=False)
-                videos, video_metadata = list(videos), list(video_metadata)
-            model_inputs = self._processor(
-                text=[raw_prompt],
-                images=image_data,
-                videos=videos,
-                video_metadata=video_metadata,
-                return_tensors="pt",
-                do_sample_frames=False,
-            )
-            ids = normalize_token_ids(model_inputs["input_ids"])
-        else:
-            ids = normalize_token_ids(
-                _apply_chat_template(
-                    self._tokenizer, messages, add_generation_prompt=True,
-                    **self._apply_chat_template_kwargs,
-                )
-            )
+        )
         return ids[len(self._system_prompt):]
 
     async def _decode_response(
@@ -483,7 +360,22 @@ class _GatewayActor:
                 }
                 return message, "tool_calls"
         response_text = self._tokenizer.decode(response_ids, skip_special_tokens=True)
-        return {"role": "assistant", "content": response_text}, stop_reason or "stop"
+        # Normalize to OpenAI-compatible finish_reason values
+        # (litellm/pydantic strictly validates this field).
+        _FINISH_REASON_MAP = {
+            "completed": "stop",
+            "finished": "stop",
+            "finish_reason_unspecified": "stop",
+            "eos": "stop",
+            "abort": "stop",
+            "max_tokens": "length",
+            "max_new_tokens": "length",
+            "length_limit": "length",
+        }
+        normalized = _FINISH_REASON_MAP.get(stop_reason, stop_reason) if stop_reason else "stop"
+        if normalized not in ("stop", "length", "tool_calls", "content_filter", "function_call"):
+            normalized = "stop"
+        return {"role": "assistant", "content": response_text}, normalized
 
     async def _handle_chat_completions(self, session_id: str, payload: dict[str, Any]) -> JSONResponse:
         session = self._sessions.get(session_id)
@@ -504,34 +396,16 @@ class _GatewayActor:
             tools = request_context["tools"]
             next_trajectory_id = session.next_trajectory_id
             materialized_trajectory = None
-            image_data = None
-            video_data = None
 
             if session.active_trajectory is None:
-                image_data, video_data = await self._extract_multi_modal_data(messages)
                 active_trajectory = TrajectoryBuffer(
-                    prompt_ids=self._encode_full(messages, tools=tools, image_data=image_data, video_data=video_data)
+                    prompt_ids=self._encode_full(messages, tools=tools)
                 )
             elif _is_request_context_prefix(session=session, messages=messages, tools=tools):
                 active_trajectory = _copy_trajectory_buffer(session.active_trajectory)
-                image_data = list(session.image_data) if session.image_data is not None else None
-                video_data = list(session.video_data) if session.video_data is not None else None
                 incremental_messages = messages[len(session.message_history) :]
                 if incremental_messages:
-                    new_image_data, new_video_data = await self._extract_multi_modal_data(incremental_messages)
-                    if new_image_data:
-                        if image_data is None:
-                            image_data = []
-                        image_data.extend(new_image_data)
-                    if new_video_data:
-                        if video_data is None:
-                            video_data = []
-                        video_data.extend(new_video_data)
-                    incremental_ids = self._encode_incremental(
-                        incremental_messages,
-                        image_data=new_image_data,
-                        video_data=new_video_data,
-                    )
+                    incremental_ids = self._encode_incremental(incremental_messages)
                     active_trajectory.response_ids.extend(incremental_ids)
                     active_trajectory.response_mask.extend([0] * len(incremental_ids))
                     if active_trajectory.response_logprobs:
@@ -543,9 +417,8 @@ class _GatewayActor:
                     trajectory_id=next_trajectory_id,
                 )
                 next_trajectory_id += 1
-                image_data, video_data = await self._extract_multi_modal_data(messages)
                 active_trajectory = TrajectoryBuffer(
-                    prompt_ids=self._encode_full(messages, tools=tools, image_data=image_data, video_data=video_data)
+                    prompt_ids=self._encode_full(messages, tools=tools)
                 )
 
             # TODO: prompt_ids for generate requests are different from those in trajectories, shall we use different variable names?
@@ -559,8 +432,6 @@ class _GatewayActor:
                 request_id=session_id,
                 prompt_ids=generation_context_ids,
                 sampling_params=sampling_params,
-                image_data=image_data,
-                video_data=video_data,
             )
 
             response_ids = list(output.token_ids)
@@ -576,8 +447,6 @@ class _GatewayActor:
                 session.trajectories.append(materialized_trajectory)
             session.next_trajectory_id = next_trajectory_id
             session.active_trajectory = active_trajectory
-            session.image_data = list(image_data) if image_data is not None else None
-            session.video_data = list(video_data) if video_data is not None else None
             session.message_history = messages + [assistant_msg]
             session.request_tools = tools
             self._touch_session(session)
