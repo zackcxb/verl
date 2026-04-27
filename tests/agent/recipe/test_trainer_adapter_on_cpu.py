@@ -312,6 +312,45 @@ def test_adapter_generate_sequences_returns_dataproto():
     assert tu.get(captured["prompts"], "raw_prompt") == input_dp.non_tensor_batch["raw_prompt"].tolist()
 
 
+def test_adapter_generate_sequences_accepts_non_tensor_only_dataproto():
+    AgentFrameworkRolloutAdapter = _import_adapter_class()
+    from verl.utils import tensordict_utils as tu
+
+    captured = {}
+
+    async def fake_generate(prompts):
+        captured["prompts"] = prompts
+        return _make_framework_output(batch_size=len(prompts), timing={"framework": 2.0})
+
+    class FakeFramework:
+        async def generate_sequences(self, prompts):
+            return await fake_generate(prompts)
+
+    adapter = AgentFrameworkRolloutAdapter.__new__(AgentFrameworkRolloutAdapter)
+    adapter._framework = FakeFramework()
+    input_dp = DataProto.from_dict(
+        non_tensors={
+            "raw_prompt": np.array(
+                [
+                    [{"role": "user", "content": "sample 0"}],
+                    [{"role": "user", "content": "sample 1"}],
+                ],
+                dtype=object,
+            ),
+            "data_source": np.array(["deepeyes", "deepeyes"], dtype=object),
+            "reward_model": np.array([{"ground_truth": "0"}, {"ground_truth": "1"}], dtype=object),
+            "uid": np.array(["uid-0", "uid-1"], dtype=object),
+        }
+    )
+
+    output_dp = adapter.generate_sequences(input_dp)
+
+    assert isinstance(output_dp, DataProto)
+    assert output_dp.meta_info["timing"]["framework"] == 2.0
+    assert output_dp.non_tensor_batch["uid"].tolist() == ["uid-0", "uid-1"]
+    assert tu.get(captured["prompts"], "raw_prompt") == input_dp.non_tensor_batch["raw_prompt"].tolist()
+
+
 def test_adapter_prebinds_per_sample_tools_kwargs_for_framework_runner():
     AgentFrameworkRolloutAdapter = _import_adapter_class()
     from verl.agent.framework.types import SessionHandle

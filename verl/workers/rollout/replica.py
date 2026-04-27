@@ -387,11 +387,18 @@ def _load_trtllm():
     return TRTLLMReplica
 
 
+def _load_hf_transformers():
+    from verl.workers.rollout.hf_transformers_rollout import HFTransformersReplica
+
+    return HFTransformersReplica
+
+
 # Register built-in types
 RolloutReplicaRegistry.register("vllm", _load_vllm)
 RolloutReplicaRegistry.register("sglang", _load_sglang)
 RolloutReplicaRegistry.register("trtllm", _load_trtllm)
 RolloutReplicaRegistry.register("vllm_omni", _load_vllm_omni)
+RolloutReplicaRegistry.register("hf_transformers", _load_hf_transformers)
 
 
 # Original function for backward compatibility

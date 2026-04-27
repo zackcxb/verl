@@ -101,7 +101,7 @@ def test_dataset_replaces_image_placeholder_and_builds_tool_kwargs():
     user_content = item["raw_prompt"][1]["content"]
     assert user_content[0] == {"type": "text", "text": "Inspect "}
     assert user_content[1]["type"] == "image"
-    assert isinstance(user_content[1]["image"], Image.Image)
+    assert user_content[1]["image"].startswith("data:image/png;base64,")
     assert user_content[2] == {"type": "text", "text": " and answer."}
     tool_image = item["tools_kwargs"]["image_zoom_in_tool"]["create_kwargs"]["image"]
     assert isinstance(tool_image, Image.Image)
