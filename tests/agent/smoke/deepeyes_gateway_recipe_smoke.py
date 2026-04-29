@@ -102,6 +102,7 @@ def main() -> None:
             "has_responses": "responses" in output_dp.batch,
             "has_input_ids": "input_ids" in output_dp.batch,
             "has_attention_mask": "attention_mask" in output_dp.batch,
+            "has_response_mask": "response_mask" in output_dp.batch,
             "has_position_ids": "position_ids" in output_dp.batch,
             "has_rm_scores": "rm_scores" in output_dp.batch,
             "has_timing": "timing" in output_dp.meta_info,
@@ -119,6 +120,7 @@ def main() -> None:
         assert "responses" in output_dp.batch
         assert "input_ids" in output_dp.batch
         assert "attention_mask" in output_dp.batch
+        assert "response_mask" in output_dp.batch
         assert "position_ids" in output_dp.batch
         assert "rm_scores" in output_dp.batch
         assert "timing" in output_dp.meta_info

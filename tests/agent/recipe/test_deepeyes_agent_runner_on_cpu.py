@@ -237,6 +237,44 @@ async def test_deepeyes_agent_runner_executes_tool_call_and_continues(monkeypatc
     assert isinstance(continuation_messages[2]["content"][1]["image"], Image.Image)
 
 
+class FakeFailingImageZoomInTool(FakeImageZoomInTool):
+    async def execute(self, instance_id: str, parameters: dict[str, Any], **kwargs):
+        self.execute_calls.append(
+            {
+                "instance_id": instance_id,
+                "parameters": parameters,
+                "kwargs": kwargs,
+            }
+        )
+        raise RuntimeError("tool execute failed")
+
+
+@pytest.mark.asyncio
+async def test_deepeyes_agent_runner_releases_tool_on_execute_failure(monkeypatch):
+    agent_runner = _import_agent_runner_module()
+    monkeypatch.setattr(agent_runner, "ImageZoomInTool", FakeFailingImageZoomInTool)
+    calls = _patch_http_client(
+        monkeypatch,
+        agent_runner,
+        [_chat_response(tool_calls=[_tool_call({"bbox_2d": [0, 0, 32, 32]})])],
+    )
+
+    with pytest.raises(RuntimeError, match="tool execute failed"):
+        await agent_runner.deepeyes_agent_runner(
+            raw_prompt=[{"role": "user", "content": "Inspect this image."}],
+            session=SessionHandle(session_id="session-fail", base_url="http://gateway/sessions/session-fail/v1"),
+            sample_index=0,
+            tools_kwargs={"image_zoom_in_tool": {"create_kwargs": {"image": Image.new("RGB", (64, 64))}}},
+            tool_config={"config": {"num_workers": 1, "rate_limit": 1}},
+            max_turns=5,
+        )
+
+    assert len(calls) == 1
+    tool = FakeFailingImageZoomInTool.instances[0]
+    assert len(tool.execute_calls) == 1
+    assert tool.release_calls == [{"instance_id": "tool-instance-0", "kwargs": {}}]
+
+
 @pytest.mark.asyncio
 async def test_deepeyes_agent_runner_stops_when_response_has_no_tool_calls(monkeypatch):
     agent_runner = _import_agent_runner_module()
